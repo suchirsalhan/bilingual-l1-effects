@@ -1,3 +1,5 @@
+# TO DO – 1024 OR 512 =  sequence length + context window, max_len = prompt_len + 220 tokens (or 500 tokens). 
+# generate a config.json before running. 
 import random
 import json
 from datasets import load_dataset, Dataset
