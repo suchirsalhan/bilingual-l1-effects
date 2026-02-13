@@ -1,4 +1,4 @@
-## this was based on the other code, adapted for a huggingface dataset rather than github ##
+## this was based on the other code 'another instruction tuning', adapted for a huggingface dataset rather than github ##
 
 from importlib.metadata import version
 
