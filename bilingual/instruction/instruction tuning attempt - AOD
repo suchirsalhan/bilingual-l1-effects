@@ -1,0 +1,591 @@
+## this was based on the other code, adapted for a huggingface dataset rather than github ##
+
+from importlib.metadata import version
+
+pkgs = [
+    "numpy",       # PyTorch & TensorFlow dependency
+    "matplotlib",  # Plotting library
+    "tiktoken",    # Tokenizer
+    "torch",       # Deep learning library
+    "tqdm",        # Progress bar
+    "tensorflow",  # For OpenAI's pretrained weights
+]
+for p in pkgs:
+    print(f"{p} version: {version(p)}")
+
+    ##THIS IMPORTS THE NEW DATASET - STRUCTURED DIFFERENTLY BECAUSE IT IS HUGGINGFACE RATHER THAN GITHUB##
+
+import json
+import os
+import requests
+
+!pip install datasets
+
+from datasets import load_dataset
+
+# Load dataset
+dataset = load_dataset("ChristophSchuhmann/essays-with-instructions")
+
+# Print dataset structure
+print(dataset)
+
+# Access a split (usually "train")
+train_data = dataset["train"]
+
+print("Number of entries:", len(train_data))
+
+# View first example
+print(train_data[0])
+
+print(train_data.column_names)
+
+## this converts the format to the same github structure ##
+def convert_format(example):
+    return {
+        "instruction": example["instructions"],
+        "input": "",  # no input field in this dataset
+        "output": example["essays"]
+    }
+
+converted_data = [convert_format(ex) for ex in train_data]
+
+print(converted_data[0])
+print("Number of entries:", len(converted_data))
+
+print("Example entry:\n", converted_data[50])
+
+def format_input(entry):
+    instruction_text = (
+        f"Below is an instruction that describes a task. "
+        f"Write a response that appropriately completes the request."
+        f"\n\n### Instruction:\n{entry['instruction']}"
+    )
+
+    input_text = f"\n\n### Input:\n{entry['input']}" if entry["input"] else ""
+
+    return instruction_text + input_text
+
+
+train_portion = int(len(converted_data) * 0.85)  # 85% for training
+test_portion = int(len(converted_data) * 0.1)    # 10% for testing
+val_portion = len(converted_data) - train_portion - test_portion  # Remaining 5% for validation
+
+train_data = converted_data[:train_portion]
+test_data = converted_data[train_portion:train_portion + test_portion]
+val_data = converted_data[train_portion + test_portion:]
+
+import torch
+from torch.utils.data import Dataset
+
+
+class InstructionDataset(Dataset):
+    def __init__(self, data, tokenizer):
+        self.data = data
+
+        # Pre-tokenize texts
+        self.encoded_texts = []
+        for entry in data:
+            instruction_plus_input = format_input(entry)
+            response_text = f"\n\n### Response:\n{entry['output']}"
+            full_text = instruction_plus_input + response_text
+            self.encoded_texts.append(
+                tokenizer.encode(full_text)
+            )
+
+    def __getitem__(self, index):
+        return self.encoded_texts[index]
+
+    def __len__(self):
+        return len(self.data)
+
+        #this (above) ran, but im slightly confused bc i didnt change 'data' to 'converted_data'
+
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+tokenizer = AutoTokenizer.from_pretrained("catherinearnett/B-GPT_es_en_sequential") #or another model
+
+# Ensure <|endoftext|> is recognized as eos_token and set as pad_token
+# GPT-2 models typically use <|endoftext|> as their EOS token (ID 50256)
+if tokenizer.eos_token is None:
+    tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
+    # If added, its ID will be the next available in vocabulary, or it will map to an existing token if present.
+
+# Set pad_token to eos_token if not already set (common practice for GPT-2)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+new_special_tokens = {}
+
+# Add missing EOS, CLS, SEP tokens
+if tokenizer.eos_token is None:
+    new_special_tokens["eos_token"] = "<|endoftext|>"
+if tokenizer.cls_token is None:
+    new_special_tokens["cls_token"] = "[CLS]"
+if tokenizer.sep_token is None:
+    new_special_tokens["sep_token"] = "[SEP]"
+
+# If we have new special tokens, add them and resize model embeddings
+if new_special_tokens:
+    tokenizer.add_special_tokens(new_special_tokens)
+    model.resize_token_embeddings(len(tokenizer))
+
+# Update cls_id and sep_id
+cls_id = tokenizer.cls_token_id
+sep_id = tokenizer.sep_token_id
+
+print("Tokenizer vocab size (after adding special tokens):", len(tokenizer))
+print(f"EOS token: {tokenizer.eos_token}, ID: {tokenizer.eos_token_id}")
+print(f"PAD token: {tokenizer.pad_token}, ID: {tokenizer.pad_token_id}")
+print(f"CLS token ID: {cls_id}")
+print(f"SEP token ID: {sep_id}")
+
+# Verification for <|endoftext|> encoding (should be a single token if correctly set as EOS)
+encoded_eos = tokenizer.encode(tokenizer.eos_token, add_special_tokens=False)
+print(f"Encoded EOS token: {encoded_eos}")
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+tokenizer = AutoTokenizer.from_pretrained("catherinearnett/B-GPT_es_en_sequential")
+
+print(tokenizer.encode("<|endoftext|>", allowed_special={"<|endoftext|>"}))
+
+def custom_collate_fn(
+    batch,
+    pad_token_id=tokenizer.pad_token_id, # Use tokenizer's pad_token_id for consistency
+    ignore_index=-100,
+    allowed_max_length=None,
+    device="cpu"
+):
+    # Find the longest sequence in the batch
+    batch_max_length = max(len(item)+1 for item in batch)
+
+    # Pad and prepare inputs and targets
+    inputs_lst, targets_lst = [], []
+
+    for item in batch:
+        new_item = item.copy()
+        # Add an <|endoftext|> token (represented by pad_token_id for GPT-2)
+        new_item += [pad_token_id]
+        # Pad sequences to max_length
+        padded = (
+            new_item + [pad_token_id] *
+            (batch_max_length - len(new_item))
+        )
+        inputs = torch.tensor(padded[:-1])  # Truncate the last token for inputs
+        targets = torch.tensor(padded[1:])  # Shift +1 to the right for targets
+
+        # New: Replace all but the first padding tokens in targets by ignore_index
+        mask = targets == pad_token_id
+        indices = torch.nonzero(mask).squeeze()
+        if indices.numel() > 1:
+            targets[indices[1:]] = ignore_index
+
+        # New: Optionally truncate to maximum sequence length
+        if allowed_max_length is not None:
+            inputs = inputs[:allowed_max_length]
+            targets = targets[:allowed_max_length]
+
+        inputs_lst.append(inputs)
+        targets_lst.append(targets)
+
+    # Convert list of inputs and targets to tensors and transfer to target device
+    inputs_tensor = torch.stack(inputs_lst).to(device)
+    targets_tensor = torch.stack(targets_lst).to(device)
+
+    return inputs_tensor, targets_tensor
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    # Use PyTorch 2.9 or newer for stable mps results
+    major, minor = map(int, torch.__version__.split(".")[:2])
+    if (major, minor) >= (2, 9):
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+else:
+    device = torch.device("cpu")
+
+print("Device:", device)
+
+model = AutoModelForCausalLM.from_pretrained("catherinearnett/B-GPT_es_en_sequential", revision = "128000")
+
+# Resize model embeddings to match tokenizer's new vocabulary size if it changed
+if len(tokenizer) > model.config.vocab_size:
+    print(f"Resizing model embeddings from {model.config.vocab_size} to {len(tokenizer)}")
+    model.resize_token_embeddings(len(tokenizer))
+
+# Set model config pad/eos token IDs to match the tokenizer
+model.config.pad_token_id = tokenizer.pad_token_id
+model.config.eos_token_id = tokenizer.eos_token_id
+
+model.eval();
+
+from functools import partial
+
+customized_collate_fn = partial(
+    custom_collate_fn,
+    device=device,
+    allowed_max_length=model.config.n_positions
+)
+
+from torch.utils.data import DataLoader
+
+
+num_workers = 0
+batch_size = 8
+
+torch.manual_seed(123)
+
+train_dataset = InstructionDataset(train_data, tokenizer)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    collate_fn=customized_collate_fn,
+    shuffle=True,
+    drop_last=True,
+    num_workers=num_workers
+)
+
+val_dataset = InstructionDataset(val_data, tokenizer)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    collate_fn=customized_collate_fn,
+    shuffle=False,
+    drop_last=False,
+    num_workers=num_workers
+)
+
+test_dataset = InstructionDataset(test_data, tokenizer)
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=batch_size,
+    collate_fn=customized_collate_fn,
+    shuffle=False,
+    drop_last=False,
+    num_workers=num_workers
+)
+
+def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
+                       eval_freq, eval_iter, start_context, tokenizer):
+    # Initialize lists to track losses and tokens seen
+    train_losses, val_losses, track_tokens_seen = [], [], []
+    tokens_seen, global_step = 0, -1
+
+    # Main training loop
+    for epoch in range(num_epochs):
+        model.train()  # Set model to training mode
+
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad() # Reset loss gradients from previous batch iteration
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            loss.backward() # Calculate loss gradients
+            optimizer.step() # Update model weights using loss gradients
+            tokens_seen += input_batch.numel()
+            global_step += 1
+
+            # Optional evaluation step
+            if global_step % eval_freq == 0:
+                train_loss, val_loss = evaluate_model(
+                    model, train_loader, val_loader, device, eval_iter)
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                track_tokens_seen.append(tokens_seen)
+                print(f"Ep {epoch+1} (Step {global_step:06d}): "
+                      f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
+
+        # Print a sample text after each epoch
+        generate_and_print_sample(
+            model, tokenizer, device, start_context
+        )
+
+    return train_losses, val_losses, track_tokens_seen
+
+
+def evaluate_model(model, train_loader, val_loader, device, eval_iter):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
+    model.train()
+    return train_loss, val_loss
+
+
+def generate_and_print_sample(model, tokenizer, device, start_context):
+    model.eval()
+    context_size = model.config.n_positions
+    encoded = tokenizer(
+        start_context,
+        return_tensors="pt"
+    ).input_ids.to(device)
+
+    with torch.no_grad():
+        token_ids = generate_text_simple(
+            model=model, idx=encoded,
+            max_new_tokens=50, context_size=context_size
+        )
+
+    decoded_text = tokenizer.decode(token_ids[0], skip_special_tokens=True)
+    print(decoded_text.replace("\n", " "))  # Compact print format
+    model.train()
+
+def calc_loss_batch(input_batch, target_batch, model, device):
+    input_batch, target_batch = input_batch.to(device), target_batch.to(device)
+    outputs = model(input_batch)  # outputs is CausalLMOutputWithCrossAttentions
+    logits = outputs.logits       # get the actual tensor
+    loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
+    return loss
+
+def calc_loss_loader(data_loader, model, device, num_batches=None):
+    total_loss = 0.
+    if len(data_loader) == 0:
+        return float("nan")
+    elif num_batches is None:
+        num_batches = len(data_loader)
+    else:
+        # Reduce the number of batches to match the total number of batches in the data loader
+        # if num_batches exceeds the number of batches in the data loader
+        num_batches = min(num_batches, len(data_loader))
+    for i, (input_batch, target_batch) in enumerate(data_loader):
+        if i < num_batches:
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            total_loss += loss.item()
+        else:
+            break
+    return total_loss / num_batches
+
+    model.to(device)
+
+torch.manual_seed(123)
+
+with torch.no_grad():
+    train_loss = calc_loss_loader(train_loader, model, device, num_batches=5)
+    val_loss = calc_loss_loader(val_loader, model, device, num_batches=5)
+
+print("Training loss:", train_loss)
+print("Validation loss:", val_loss)
+
+def generate_text_simple(model, idx, max_new_tokens, context_size):
+    for _ in range(max_new_tokens):
+        # Crop current context if it exceeds model's context size
+        idx_cond = idx[:, -context_size:]
+
+        # Get model predictions
+        with torch.no_grad():
+            logits = model(idx_cond).logits  # <--- important!
+
+        # Focus only on the last time step
+        logits = logits[:, -1, :]  # (batch, vocab_size)
+
+        # Convert to probabilities
+        probas = torch.softmax(logits, dim=-1)
+
+        # Pick the most likely token
+        idx_next = torch.argmax(probas, dim=-1, keepdim=True)  # (batch, 1)
+
+        # Append to running sequence
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+
+    
+import time
+
+start_time = time.time()
+
+torch.manual_seed(123)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.00005, weight_decay=0.1)
+
+num_epochs = 2
+
+train_losses, val_losses, tokens_seen = train_model_simple(
+    model, train_loader, val_loader, optimizer, device,
+    num_epochs=num_epochs, eval_freq=5, eval_iter=5,
+    start_context=format_input(val_data[0]), tokenizer=tokenizer
+)
+
+end_time = time.time()
+execution_time_minutes = (end_time - start_time) / 60
+print(f"Training completed in {execution_time_minutes:.2f} minutes.")
+
+def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+
+    # For-loop is the same as before: Get logits, and only focus on last time step
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -context_size:]
+        with torch.no_grad():
+            logits = model(idx_cond)
+        logits = logits[:, -1, :]
+
+        # New: Filter logits with top_k sampling
+        if top_k is not None:
+            # Keep only top_k values
+            top_logits, _ = torch.topk(logits, top_k)
+            min_val = top_logits[:, -1]
+            logits = torch.where(logits < min_val, torch.tensor(float("-inf")).to(logits.device), logits)
+
+        # New: Apply temperature scaling
+        if temperature > 0.0:
+            logits = logits / temperature
+
+            # New (not in book): numerical stability tip to get equivalent results on mps device
+            # subtract rowwise max before softmax
+            logits = logits - logits.max(dim=-1, keepdim=True).values
+
+            # Apply softmax to get probabilities
+            probs = torch.softmax(logits, dim=-1)  # (batch_size, context_len)
+
+            # Sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
+
+        # Otherwise same as before: get idx of the vocab entry with the highest logits value
+        else:
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
+
+        if idx_next == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
+            break
+
+        # Same as before: append sampled index to the running sequence
+        idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
+
+    return idx
+
+torch.manual_seed(123)
+
+for entry in test_data[:3]:
+    input_text = format_input(entry)
+
+    # Tokenize input text
+    encoded = tokenizer(
+        input_text,
+        return_tensors="pt"
+    ).input_ids.to(device)
+
+    # Generate new tokens
+    token_ids = generate_text_simple(
+        model=model,
+        idx=encoded,
+        max_new_tokens=256,
+        context_size=model.config.n_positions
+    )
+
+    # Decode to text
+    generated_text = tokenizer.decode(token_ids[0], skip_special_tokens=True)
+
+    # Extract the model’s response
+    response_text = (
+        generated_text[len(input_text):]
+        .replace("### Response:", "")
+        .strip()
+    )
+
+    print(input_text)
+    print(f"\nCorrect response:\n>> {entry['output']}")
+    print(f"\nModel response:\n>> {response_text.strip()}")
+    print("-------------------------------------")
+
+model.save_pretrained("my_model")
+tokenizer.save_pretrained("my_model")
+
+import shutil
+
+shutil.make_archive("my_model", 'zip', "my_model")
+print("Folder zipped as my_model.zip")
+
+
+from google.colab import files
+
+files.download("my_model.zip")
+
+model.eval()
+
+AutoModelForCausalLM.from_pretrained(
+    "catherinearnett/B-GPT_es_en_sequential"
+) 
+#or another model
+
+#just to test the config
+print(model.config)
+print(model.transformer.wpe.weight.shape)
+
+##testing out the instructions - but unsure which structure works, and whether this is influenced by the 128 max context window##
+prompt = "### Instruction: Tell me about otters \n### Input:\n### Response:"
+
+# Tokenize on CPU first
+encoded = tokenizer(
+    prompt,
+    return_tensors="pt",
+    truncation=True,
+    max_length=model.config.max_position_embeddings - 50,
+    padding=False
+)
+
+# **Validate token IDs**
+if encoded.input_ids.max() >= len(tokenizer):
+    raise ValueError("Token ID exceeds tokenizer vocab size!")
+
+# Now move to GPU
+encoded = encoded.input_ids.to(device)
+
+output_ids = model.generate(
+    input_ids=encoded,
+    max_new_tokens=50,  # small first test
+    do_sample=True,
+    temperature=0.7,
+    pad_token_id=tokenizer.pad_token_id
+)
+
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+
+
+##another test for prompting##
+prompt = "### Instruction: Do you prefer having a big or a small family? \n### Input:\n### Response:"
+
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+
+output_ids = model.generate(
+    encoded,
+    max_new_tokens=50,  # keep reasonable
+)
+
+
+##a third test for prompting##
+prompt = "### Instruction: Write a newspaper article about what activities you can do in your town at the weekend. Write around 800 characters \n### Input:\n### Response:"
+
+encoded = tokenizer(
+    prompt,
+    return_tensors="pt",
+    truncation=True,
+    max_length=model.config.max_position_embeddings - 50,
+    padding=False
+)
+
+# Step 2: Check for invalid token IDs
+if encoded.input_ids.max() >= model.get_input_embeddings().num_embeddings:
+    print("WARNING: Token ID exceeds model embeddings!")
+    # Option 1: truncate token IDs to the valid range (temporary hack)
+    encoded.input_ids = torch.clamp(encoded.input_ids, max=model.get_input_embeddings().num_embeddings - 1)
+    print("Clamped token IDs to valid range.")
+
+# Step 3: Move to GPU safely
+encoded = encoded.input_ids.to(device)
+
+# Step 4: Generate safely
+output_ids = model.generate(
+    input_ids=encoded,
+    max_new_tokens=50,
+    do_sample=True,
+    temperature=0.7,
+    pad_token_id=tokenizer.pad_token_id
+)
+
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+
+##a fourth test for prompting##
+prompt = "### Instruction: The capital of France is Paris. What is the capital of France? \n### Input:\n### Response:"
+encoded = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+output_ids = model.generate(encoded, max_new_tokens=2000)
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
