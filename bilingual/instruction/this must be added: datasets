@@ -1,0 +1,21 @@
+##depending on the different datasets being used, there will be different formats of the instructions and responses##
+
+#so need to run:
+
+print(dataset.column_names)
+
+#before running the 'format function' box (from the instruction_tuning code)
+
+# -----------------------------
+# FORMAT FUNCTION
+# -----------------------------
+def format_example(example):
+
+    prompt = f"### Instruction:\n{example['instructions']}\n\n### Response:\n"
+    answer = example["essays"]
+
+
+#the square brackets 'instructions' 'essays' will need to be changed based on 
+#what is in the column names of the dataset 
+#e.g. instructions > instruction
+#e.g. essays > output
