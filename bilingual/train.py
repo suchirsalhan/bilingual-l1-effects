@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, random
+import os, json, random, time, logging
 import torch
 from datasets import load_dataset
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
@@ -9,44 +9,57 @@ from huggingface_hub import HfApi, create_repo, upload_folder
 # CONFIG
 # ============================================================
 
-SEQ_LEN=512
-LR=5e-5
-DEVICE="cuda"
+LR = 5e-5
+DEVICE = "cuda"
 
-TOTAL_TOKENS=20_000_000_000
-PHASE1_TOKENS=TOTAL_TOKENS//2
-L2_TOTAL=int(TOTAL_TOKENS*(1/3))
-L1_PHASE2=int(TOTAL_TOKENS*(1/6))
+TOTAL_TOKENS = 20_000_000_000
+PHASE1_TOKENS = TOTAL_TOKENS // 2
+L2_TOTAL = int(TOTAL_TOKENS * (1/3))
+L1_PHASE2 = int(TOTAL_TOKENS * (1/6))
 
-CHECKPOINT_FRACS=[0.25,0.5,0.75,1.0]
-CHECKPOINT_TOKENS=[int(L2_TOTAL*x) for x in CHECKPOINT_FRACS]
+CHECKPOINT_FRACS = [0.25, 0.5, 0.75, 1.0]
+CHECKPOINT_TOKENS = [int(L2_TOTAL*x) for x in CHECKPOINT_FRACS]
 
-HF_USER="suchirsalhan"
-SAVE_DIR="./runs"
-STATE_FILE="trainer_state.json"
+HF_USER = "suchirsalhan"
+SAVE_DIR = "./runs"
+STATE_FILE = "trainer_state.json"
 
-LEVEL_NAMES={
-    0:"beginner",
-    1:"intermediate",
-    2:"advanced",
-    3:"fluent"
-}
+LEVEL_NAMES = {0:"beginner",1:"intermediate",2:"advanced",3:"fluent"}
 
-os.makedirs(SAVE_DIR,exist_ok=True)
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_DIR, "training.log")),
+        logging.StreamHandler()
+    ]
+)
 
 # ============================================================
 # TOKENIZER / MODEL
 # ============================================================
 
-tokenizer=GPT2TokenizerFast.from_pretrained("gpt2")
-tokenizer.pad_token=tokenizer.eos_token
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+
+model_template = GPT2LMHeadModel.from_pretrained("gpt2")
+MAX_POSITIONS = model_template.config.n_positions
+SEQ_LEN = min(512, MAX_POSITIONS)
+del model_template  # free memory
 
 def load_or_create_model(run_dir):
-    if os.path.exists(os.path.join(run_dir,"pytorch_model.bin")):
-        print("Resuming model weights")
-        model=GPT2LMHeadModel.from_pretrained(run_dir)
+    if os.path.exists(os.path.join(run_dir, "pytorch_model.bin")):
+        logging.info("Resuming model weights")
+        model = GPT2LMHeadModel.from_pretrained(run_dir)
     else:
-        model=GPT2LMHeadModel.from_pretrained("gpt2")
+        logging.info("Initializing GPT2 base model")
+        model = GPT2LMHeadModel.from_pretrained("gpt2")
     return model.to(DEVICE)
 
 # ============================================================
@@ -66,174 +79,174 @@ def default_state():
     )
 
 def load_state(run_dir):
-    path=os.path.join(run_dir,STATE_FILE)
+    path = os.path.join(run_dir, STATE_FILE)
     if os.path.exists(path):
         with open(path) as f:
-            s=json.load(f)
-        print("Loaded trainer state")
+            s = json.load(f)
+        logging.info("Loaded trainer state")
         return s
     return default_state()
 
-def save_state(run_dir,state):
-    state["rng"]=random.getstate()
-    state["torch_rng"]=torch.get_rng_state().tolist()
-    state["cuda_rng"]=torch.cuda.get_rng_state().tolist()
-
-    with open(os.path.join(run_dir,STATE_FILE),"w") as f:
-        json.dump(state,f)
+def save_state(run_dir, state):
+    state["rng"] = random.getstate()
+    state["torch_rng"] = torch.get_rng_state().tolist()
+    state["cuda_rng"] = torch.cuda.get_rng_state().tolist()
+    with open(os.path.join(run_dir, STATE_FILE), "w") as f:
+        json.dump(state, f)
 
 # ============================================================
-# DATA STREAMS (resume-safe)
+# DATA STREAMS (skip too long examples)
 # ============================================================
 
-def cultura_stream(lang,skip_tokens=0):
-    ds=load_dataset("uonlp/CulturaX",lang,split="train",streaming=True)
-    seen=0
+def cultura_stream(lang, skip_tokens=0):
+    ds = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
+    seen = 0
     for ex in ds:
-        ids=tokenizer(ex["text"])["input_ids"]
-        if seen+len(ids)<skip_tokens:
-            seen+=len(ids)
+        ids = tokenizer(ex["text"])["input_ids"]
+        if len(ids) > MAX_POSITIONS:
+            logging.warning(f"CulturaX example too long ({len(ids)}), skipping")
+            continue
+        if seen + len(ids) < skip_tokens:
+            seen += len(ids)
             continue
         yield ids
 
 def fineweb_stream(skip_tokens=0):
-    ds=load_dataset("HuggingFaceFW/fineweb-edu",split="train",streaming=True)
-    seen=0
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+    seen = 0
     for ex in ds:
-        ids=tokenizer(ex["text"])["input_ids"]
-        if seen+len(ids)<skip_tokens:
-            seen+=len(ids)
+        ids = tokenizer(ex["text"])["input_ids"]
+        if len(ids) > MAX_POSITIONS:
+            logging.warning(f"FineWeb example too long ({len(ids)}), skipping")
+            continue
+        if seen + len(ids) < skip_tokens:
+            seen += len(ids)
             continue
         yield ids
 
-def pack_blocks(token_stream):
-    buf=[]
+def pack_blocks(token_stream, seq_len=SEQ_LEN):
+    buf = []
     for tokens in token_stream:
         buf.extend(tokens)
-        while len(buf)>=SEQ_LEN:
-            yield buf[:SEQ_LEN]
-            buf=buf[SEQ_LEN:]
+        while len(buf) >= seq_len:
+            yield buf[:seq_len]
+            buf = buf[seq_len:]
 
 # ============================================================
 # HF PUSH
 # ============================================================
 
-def push_to_hub(path,lang,ckpt_idx):
-    level=LEVEL_NAMES[ckpt_idx]
-    repo_id=f"{HF_USER}/B-GPT-{lang}-fineweb-{level}"
-
-    print(f"Pushing → {repo_id}")
-
-    api=HfApi()
-    create_repo(repo_id,exist_ok=True)
-
-    upload_folder(
-        repo_id=repo_id,
-        folder_path=path,
-        commit_message=f"{level} learner checkpoint"
-    )
+def push_to_hub(path, lang, ckpt_idx):
+    level = LEVEL_NAMES[ckpt_idx]
+    repo_id = f"{HF_USER}/B-GPT-{lang}-fineweb-{level}"
+    logging.info(f"Pushing checkpoint → {repo_id}")
+    api = HfApi()
+    create_repo(repo_id, exist_ok=True)
+    upload_folder(repo_id=repo_id, folder_path=path, commit_message=f"{level} learner checkpoint")
 
 # ============================================================
 # TRAIN STEP
 # ============================================================
 
-def step(model,optim,x,y):
-    loss=model(x,labels=y).loss
+def step(model, optim, x, y):
+    loss = model(x, labels=y).loss
     loss.backward()
     optim.step()
     optim.zero_grad()
+    return loss.item()
 
 # ============================================================
 # TRAIN LOOP
 # ============================================================
 
 def train(lang):
-
-    run_dir=f"{SAVE_DIR}/{lang}"
-    os.makedirs(run_dir,exist_ok=True)
-
-    model=load_or_create_model(run_dir)
-    optimizer=torch.optim.AdamW(model.parameters(),lr=LR)
-
-    state=load_state(run_dir)
+    run_dir = f"{SAVE_DIR}/{lang}"
+    os.makedirs(run_dir, exist_ok=True)
+    model = load_or_create_model(run_dir)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    state = load_state(run_dir)
 
     # restore RNG
     random.setstate(tuple(state["rng"]))
-    torch.set_rng_state(torch.tensor(state["torch_rng"],dtype=torch.uint8))
-    torch.cuda.set_rng_state(torch.tensor(state["cuda_rng"],dtype=torch.uint8))
+    torch.set_rng_state(torch.tensor(state["torch_rng"], dtype=torch.uint8))
+    torch.cuda.set_rng_state(torch.tensor(state["cuda_rng"], dtype=torch.uint8))
 
-    l1_stream=pack_blocks(cultura_stream(lang,state["l1_seen_phase1"]+state["l1_seen_phase2"]))
-    l2_stream=pack_blocks(fineweb_stream(state["l2_seen"]))
+    l1_stream = pack_blocks(cultura_stream(lang, state["l1_seen_phase1"]+state["l1_seen_phase2"]))
+    l2_stream = pack_blocks(fineweb_stream(state["l2_seen"]))
+
+    step_count = 0
+    start_time = time.time()
 
     # ---------------- PHASE 1 ----------------
-    if state["phase"]==1:
-        print("Phase 1: L1 only")
-
+    if state["phase"] == 1:
+        logging.info("Phase 1: L1 only")
         for block in l1_stream:
-            x=torch.tensor(block[:-1]).unsqueeze(0).to(DEVICE)
-            y=torch.tensor(block[1:]).unsqueeze(0).to(DEVICE)
+            x = torch.tensor(block[:-1]).unsqueeze(0).to(DEVICE)
+            y = torch.tensor(block[1:]).unsqueeze(0).to(DEVICE)
+            loss_val = step(model, optimizer, x, y)
+            step_count += 1
+            state["l1_seen_phase1"] += len(block)
 
-            step(model,optimizer,x,y)
+            if step_count % 100 == 0:
+                elapsed = time.time() - start_time
+                logging.info(f"Step {step_count} | Loss: {loss_val:.4f} | L1 tokens seen: {state['l1_seen_phase1']:,} | Elapsed: {elapsed/60:.2f} min")
 
-            state["l1_seen_phase1"]+=len(block)
-
-            if state["l1_seen_phase1"]>=PHASE1_TOKENS:
-                state["phase"]=2
-                save_state(run_dir,state)
+            if state["l1_seen_phase1"] >= PHASE1_TOKENS:
+                state["phase"] = 2
+                save_state(run_dir, state)
                 break
-
-            if state["l1_seen_phase1"]%(50_000_000)==0:
-                save_state(run_dir,state)
+            if state["l1_seen_phase1"] % 50_000_000 == 0:
+                save_state(run_dir, state)
 
     # ---------------- PHASE 2 ----------------
-    print("Phase 2: bilingual acquisition")
+    logging.info("Phase 2: bilingual acquisition")
+    l1_iter = iter(l1_stream)
+    l2_iter = iter(l2_stream)
 
-    l1_iter=iter(l1_stream)
-    l2_iter=iter(l2_stream)
-
-    while state["l2_seen"]<L2_TOTAL:
-
+    while state["l2_seen"] < L2_TOTAL:
         for lang_id in ["l1","l2","l2"]:
+            block = next(l1_iter) if lang_id=="l1" else next(l2_iter)
+            x = torch.tensor(block[:-1]).unsqueeze(0).to(DEVICE)
+            y = torch.tensor(block[1:]).unsqueeze(0).to(DEVICE)
+            loss_val = step(model, optimizer, x, y)
+            step_count += 1
 
-            block=next(l1_iter) if lang_id=="l1" else next(l2_iter)
-
-            x=torch.tensor(block[:-1]).unsqueeze(0).to(DEVICE)
-            y=torch.tensor(block[1:]).unsqueeze(0).to(DEVICE)
-
-            step(model,optimizer,x,y)
-
-            if lang_id=="l2":
-                state["l2_seen"]+=len(block)
+            if lang_id == "l2":
+                state["l2_seen"] += len(block)
             else:
-                state["l1_seen_phase2"]+=len(block)
+                state["l1_seen_phase2"] += len(block)
 
-            # -------- CHECKPOINT --------
-            while state["checkpoint_idx"]<len(CHECKPOINT_TOKENS) and \
-                  state["l2_seen"]>=CHECKPOINT_TOKENS[state["checkpoint_idx"]]:
+            # LOGGING
+            if step_count % 100 == 0:
+                elapsed = time.time() - start_time
+                logging.info(
+                    f"Step {step_count} | Loss: {loss_val:.4f} | "
+                    f"L1 seen phase2: {state['l1_seen_phase2']:,} | L2 seen: {state['l2_seen']:,} | "
+                    f"ratio: {state['l1_seen_phase2']/max(1,state['l2_seen']):.3f} | "
+                    f"Elapsed: {elapsed/60:.2f} min"
+                )
 
-                pct=int(CHECKPOINT_FRACS[state["checkpoint_idx"]]*100)
-                level=LEVEL_NAMES[state["checkpoint_idx"]]
-
-                path=f"{run_dir}/checkpoint_{pct}"
-                os.makedirs(path,exist_ok=True)
-
+            # CHECKPOINT
+            while state["checkpoint_idx"] < len(CHECKPOINT_TOKENS) and state["l2_seen"] >= CHECKPOINT_TOKENS[state["checkpoint_idx"]]:
+                pct = int(CHECKPOINT_FRACS[state["checkpoint_idx"]]*100)
+                level = LEVEL_NAMES[state["checkpoint_idx"]]
+                path = f"{run_dir}/checkpoint_{pct}"
+                os.makedirs(path, exist_ok=True)
                 model.save_pretrained(path)
                 tokenizer.save_pretrained(path)
-                save_state(run_dir,state)
+                save_state(run_dir, state)
 
-                print(f"\n=== {level.upper()} ===")
-                print(f"L2 seen: {state['l2_seen']:,}")
-                print(f"L1 seen: {state['l1_seen_phase2']:,}")
-                print(f"ratio: {state['l1_seen_phase2']/state['l2_seen']:.3f}\n")
+                logging.info(f"\n=== {level.upper()} CHECKPOINT ===")
+                logging.info(f"L2 seen: {state['l2_seen']:,}")
+                logging.info(f"L1 seen: {state['l1_seen_phase2']:,}")
+                logging.info(f"ratio: {state['l1_seen_phase2']/state['l2_seen']:.3f}\n")
+                push_to_hub(path, lang, state["checkpoint_idx"])
+                state["checkpoint_idx"] += 1
 
-                push_to_hub(path,lang,state["checkpoint_idx"])
+        if state["l2_seen"] % 50_000_000 == 0:
+            save_state(run_dir, state)
 
-                state["checkpoint_idx"]+=1
-
-        if state["l2_seen"]%(50_000_000)==0:
-            save_state(run_dir,state)
-
-    print("Training complete")
+    logging.info("Training complete")
 
 # ============================================================
 # RUN ALL LANGUAGES
