@@ -1,0 +1,17 @@
+# Core
+torch>=2.1.0
+transformers[torch]>=4.45.0
+datasets[streaming,vision,text]>=2.15.0
+huggingface_hub[cli,requests]>=0.17.0
+sentencepiece>=0.1.99
+tokenizers>=0.14.3
+tqdm>=4.66.0
+numpy>=1.25.0
+
+# Optional / GPU
+# Uncomment the correct torch version for your CUDA
+# torch==2.1.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
+
+# Utilities
+requests>=2.31.0
+pyyaml>=6.0
