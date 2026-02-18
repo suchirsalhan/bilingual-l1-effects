@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import os, json, random, time, logging
+import os, json, random, time, logging, argparse
 import torch
+from torch.cuda.amp import autocast, GradScaler
 from datasets import load_dataset
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
 from huggingface_hub import HfApi, create_repo, upload_folder
@@ -11,8 +12,8 @@ from huggingface_hub import HfApi, create_repo, upload_folder
 
 LR = 5e-5
 DEVICE = "cuda"
-
-TOTAL_TOKENS = 20_000_000_000
+BATCH_SIZE = 16  # FP16 + A100 → good speed/memory balance
+TOTAL_TOKENS = 5_000_000_000  # smaller for <6h training per lang
 PHASE1_TOKENS = TOTAL_TOKENS // 2
 L2_TOTAL = int(TOTAL_TOKENS * (1/3))
 L1_PHASE2 = int(TOTAL_TOKENS * (1/6))
@@ -25,7 +26,6 @@ SAVE_DIR = "./runs"
 STATE_FILE = "trainer_state.json"
 
 LEVEL_NAMES = {0:"beginner",1:"intermediate",2:"advanced",3:"fluent"}
-
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ============================================================
@@ -132,6 +132,16 @@ def pack_blocks(token_stream, seq_len=SEQ_LEN):
             yield buf[:seq_len]
             buf = buf[seq_len:]
 
+def batchify(stream, batch_size=BATCH_SIZE):
+    batch = []
+    for block in stream:
+        batch.append(block)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
 # ============================================================
 # HF PUSH
 # ============================================================
@@ -148,22 +158,30 @@ def push_to_hub(path, lang, ckpt_idx):
 # TRAIN STEP
 # ============================================================
 
-def step(model, optim, x, y):
-    loss = model(x, labels=y).loss
-    loss.backward()
-    optim.step()
-    optim.zero_grad()
-    return loss.item()
+def step(model, optimizer, x_batch, y_batch, scaler):
+    optimizer.zero_grad()
+    loss_val = 0.0
+    for x, y in zip(x_batch, y_batch):
+        x = torch.tensor(x[:-1]).unsqueeze(0).to(DEVICE)
+        y = torch.tensor(y[1:]).unsqueeze(0).to(DEVICE)
+        with autocast():  # FP16
+            loss = model(x, labels=y).loss
+        scaler.scale(loss).backward()
+        loss_val += loss.item()
+    scaler.step(optimizer)
+    scaler.update()
+    return loss_val / len(x_batch)
 
 # ============================================================
 # TRAIN LOOP
 # ============================================================
 
 def train(lang):
-    run_dir = f"{SAVE_DIR}/{lang}"
+    run_dir = os.path.join(SAVE_DIR, lang)
     os.makedirs(run_dir, exist_ok=True)
     model = load_or_create_model(run_dir)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    scaler = GradScaler()
     state = load_state(run_dir)
 
     # restore RNG
@@ -171,8 +189,8 @@ def train(lang):
     torch.set_rng_state(torch.tensor(state["torch_rng"], dtype=torch.uint8))
     torch.cuda.set_rng_state(torch.tensor(state["cuda_rng"], dtype=torch.uint8))
 
-    l1_stream = pack_blocks(cultura_stream(lang, state["l1_seen_phase1"]+state["l1_seen_phase2"]))
-    l2_stream = pack_blocks(fineweb_stream(state["l2_seen"]))
+    l1_stream = batchify(pack_blocks(cultura_stream(lang, state["l1_seen_phase1"]+state["l1_seen_phase2"])))
+    l2_stream = batchify(pack_blocks(fineweb_stream(state["l2_seen"]))
 
     step_count = 0
     start_time = time.time()
@@ -180,14 +198,13 @@ def train(lang):
     # ---------------- PHASE 1 ----------------
     if state["phase"] == 1:
         logging.info("Phase 1: L1 only")
-        for block in l1_stream:
-            x = torch.tensor(block[:-1]).unsqueeze(0).to(DEVICE)
-            y = torch.tensor(block[1:]).unsqueeze(0).to(DEVICE)
-            loss_val = step(model, optimizer, x, y)
+        for batch in l1_stream:
+            x_batch, y_batch = batch, batch
+            loss_val = step(model, optimizer, x_batch, y_batch, scaler)
             step_count += 1
-            state["l1_seen_phase1"] += len(block)
+            state["l1_seen_phase1"] += sum(len(b) for b in batch)
 
-            if step_count % 100 == 0:
+            if step_count % 50 == 0:
                 elapsed = time.time() - start_time
                 logging.info(f"Step {step_count} | Loss: {loss_val:.4f} | L1 tokens seen: {state['l1_seen_phase1']:,} | Elapsed: {elapsed/60:.2f} min")
 
@@ -205,19 +222,17 @@ def train(lang):
 
     while state["l2_seen"] < L2_TOTAL:
         for lang_id in ["l1","l2","l2"]:
-            block = next(l1_iter) if lang_id=="l1" else next(l2_iter)
-            x = torch.tensor(block[:-1]).unsqueeze(0).to(DEVICE)
-            y = torch.tensor(block[1:]).unsqueeze(0).to(DEVICE)
-            loss_val = step(model, optimizer, x, y)
+            batch = next(l1_iter) if lang_id=="l1" else next(l2_iter)
+            x_batch, y_batch = batch, batch
+            loss_val = step(model, optimizer, x_batch, y_batch, scaler)
             step_count += 1
 
             if lang_id == "l2":
-                state["l2_seen"] += len(block)
+                state["l2_seen"] += sum(len(b) for b in batch)
             else:
-                state["l1_seen_phase2"] += len(block)
+                state["l1_seen_phase2"] += sum(len(b) for b in batch)
 
-            # LOGGING
-            if step_count % 100 == 0:
+            if step_count % 50 == 0:
                 elapsed = time.time() - start_time
                 logging.info(
                     f"Step {step_count} | Loss: {loss_val:.4f} | "
@@ -230,16 +245,13 @@ def train(lang):
             while state["checkpoint_idx"] < len(CHECKPOINT_TOKENS) and state["l2_seen"] >= CHECKPOINT_TOKENS[state["checkpoint_idx"]]:
                 pct = int(CHECKPOINT_FRACS[state["checkpoint_idx"]]*100)
                 level = LEVEL_NAMES[state["checkpoint_idx"]]
-                path = f"{run_dir}/checkpoint_{pct}"
+                path = os.path.join(run_dir, f"checkpoint_{pct}")
                 os.makedirs(path, exist_ok=True)
                 model.save_pretrained(path)
                 tokenizer.save_pretrained(path)
                 save_state(run_dir, state)
-
                 logging.info(f"\n=== {level.upper()} CHECKPOINT ===")
-                logging.info(f"L2 seen: {state['l2_seen']:,}")
-                logging.info(f"L1 seen: {state['l1_seen_phase2']:,}")
-                logging.info(f"ratio: {state['l1_seen_phase2']/state['l2_seen']:.3f}\n")
+                logging.info(f"L2 seen: {state['l2_seen']:,} | L1 seen: {state['l1_seen_phase2']:,}\n")
                 push_to_hub(path, lang, state["checkpoint_idx"])
                 state["checkpoint_idx"] += 1
 
@@ -249,10 +261,12 @@ def train(lang):
     logging.info("Training complete")
 
 # ============================================================
-# RUN ALL LANGUAGES
+# RUN
 # ============================================================
 
 if __name__=="__main__":
-    for lang in ["es","fr","de","pl","tr","ar","zh"]:
-        train(lang)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lang", type=str, required=True, help="Language to train")
+    args = parser.parse_args()
+    train(args.lang)
 
