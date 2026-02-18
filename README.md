@@ -10,9 +10,13 @@ hf auth login
 HPC 
 
 ```
+source demo311/bin/activate
 cd scripts
+bash langs.sh
 ```
 
+
+
 ```
-for lang in es fr de pl tr ar zh; do sbatch launch_slurm.wilkes3 $lang; done
+for lang in es fr de pl tr ar zh; do sbatch launch_slurm.wilkes3  --lang $lang; done
 ```
