@@ -10,7 +10,7 @@
 
 #! sbatch directives begin here ###############################
 #! Name of the job:
-#SBATCH -J baby-lm
+#SBATCH -J bilingual
 #! Which project should be charged (NB Wilkes2 projects end in '-GPU'):
 #SBATCH -A BUTTERY-SL2-GPU
 #! How many whole nodes should be allocated?
@@ -94,4 +94,4 @@ source .venv/bin/activate
 srun torchrun \
 --nnodes 1 \
 --nproc-per-node 4 \
-bilingual/train.py $@
+bilingual/train.py --lang $1 $@
