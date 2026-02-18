@@ -89,9 +89,17 @@ export LOGLEVEL=INFO
 
 #! CD back to root directory
 cd ..
-source .venv/bin/activate
 
-srun torchrun \
---nnodes 1 \
---nproc-per-node 4 \
-bilingual/train.py --lang $1 $@
+module load python/3.11.0-icl
+source demo311/bin/activate
+
+python --version
+which python
+
+torchrun \
+    --nnodes=1 \
+    --nproc-per-node=4 \
+    --rdzv-backend=c10d \
+    --rdzv-endpoint=localhost:0 \
+    bilingual/train.py --lang $1 $@
+
