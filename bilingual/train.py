@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 import os, json, random, time, logging, argparse
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast
+
+# ✅ NEW AMP API
+from torch.amp import autocast
+
 from datasets import load_dataset
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
 from huggingface_hub import HfApi, create_repo, upload_folder
+
+
+# ============================================================
+# 🚀 A100 SPEED BOOST (ONE LINE)
+# ============================================================
+
+torch.set_float32_matmul_precision("high")
 
 # ============================================================
 # CONFIG
@@ -14,7 +25,7 @@ from huggingface_hub import HfApi, create_repo, upload_folder
 
 LR = 5e-5
 SEQ_LEN = 512
-BATCH_SIZE = 16                  # per GPU
+BATCH_SIZE = 16
 GRAD_ACCUM = 2
 TOTAL_TOKENS = 5_000_000_000
 
@@ -49,6 +60,7 @@ def setup_logging(is_master, run_dir):
     if not is_master:
         logging.disable(logging.CRITICAL)
         return
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(message)s",
@@ -95,10 +107,12 @@ def save_state(run_dir, state):
 def streaming_blocks(dataset_name, config, split,
                      rank, world_size, skip_tokens=0):
 
-    ds = load_dataset(dataset_name,
-                      config,
-                      split=split,
-                      streaming=True)
+    ds = load_dataset(
+        dataset_name,
+        config,
+        split=split,
+        streaming=True
+    )
 
     ds = ds.shard(num_shards=world_size, index=rank)
 
@@ -106,9 +120,13 @@ def streaming_blocks(dataset_name, config, split,
     seen = 0
 
     for ex in ds:
+
+        # ✅ FIXED TOKENIZATION
         ids = tokenizer(
             ex["text"],
-            truncation=False,
+            truncation=True,
+            padding=False,
+            max_length=SEQ_LEN,
             add_special_tokens=False
         )["input_ids"]
 
@@ -123,7 +141,7 @@ def streaming_blocks(dataset_name, config, split,
             buffer = buffer[SEQ_LEN:]
 
 # ============================================================
-# TRAIN STEP (bf16 + accumulation)
+# TRAIN STEP (BF16 + ACCUM)
 # ============================================================
 
 def train_step(model, optimizer, batch, device, grad_accum, step_idx):
@@ -131,8 +149,10 @@ def train_step(model, optimizer, batch, device, grad_accum, step_idx):
     x = torch.tensor(batch, device=device)[:, :-1]
     y = torch.tensor(batch, device=device)[:, 1:]
 
-    with autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(x, labels=y).loss
+    # ✅ NEW autocast API
+    with autocast("cuda", dtype=torch.bfloat16):
+        outputs = model(x, labels=y)
+        loss = outputs.loss
         loss = loss / grad_accum
 
     loss.backward()
@@ -150,11 +170,15 @@ def train_step(model, optimizer, batch, device, grad_accum, step_idx):
 def push_to_hub(path, lang, ckpt_idx):
     level = LEVEL_NAMES[ckpt_idx]
     repo_id = f"{HF_USER}/B-GPT-{lang}-fineweb-{level}"
+
     api = HfApi()
     create_repo(repo_id, exist_ok=True)
-    upload_folder(repo_id=repo_id,
-                  folder_path=path,
-                  commit_message=f"{level} checkpoint")
+
+    upload_folder(
+        repo_id=repo_id,
+        folder_path=path,
+        commit_message=f"{level} checkpoint"
+    )
 
 # ============================================================
 # TRAIN
@@ -167,22 +191,27 @@ def train(lang):
 
     run_dir = os.path.join(SAVE_DIR, lang)
     os.makedirs(run_dir, exist_ok=True)
+
     setup_logging(is_master, run_dir)
 
     device = f"cuda:{local_rank}"
 
     model = GPT2LMHeadModel.from_pretrained("gpt2").to(device)
 
+    # ✅ A100 PERFORMANCE BOOST
+    model.gradient_checkpointing_enable()
+
     if is_ddp:
-        model = DDP(model,
-                    device_ids=[local_rank],
-                    gradient_as_bucket_view=True)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            gradient_as_bucket_view=True
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
     state = load_state(run_dir)
 
-    # streams
     l1_stream = streaming_blocks(
         "uonlp/CulturaX", lang, "train",
         global_rank, world_size,
@@ -205,15 +234,23 @@ def train(lang):
     checkpoint_tokens = [int(L2_TOTAL*x) for x in CHECKPOINT_FRACS]
 
     # ================= PHASE 1 =================
+
     if state["phase"] == 1:
         if is_master:
             logging.info("Phase 1: L1 only")
 
         while state["l1_seen"] < PHASE1_TOKENS:
+
             batch = [next(l1_iter) for _ in range(BATCH_SIZE)]
-            loss = train_step(model, optimizer,
-                              batch, device,
-                              GRAD_ACCUM, step_idx)
+
+            loss = train_step(
+                model,
+                optimizer,
+                batch,
+                device,
+                GRAD_ACCUM,
+                step_idx
+            )
 
             tokens = BATCH_SIZE * SEQ_LEN * world_size
             state["l1_seen"] += tokens
@@ -232,6 +269,7 @@ def train(lang):
         save_state(run_dir, state)
 
     # ================= PHASE 2 =================
+
     if is_master:
         logging.info("Phase 2: bilingual (1 L1 : 2 L2)")
 
@@ -240,11 +278,17 @@ def train(lang):
         for stream_name in ["l1","l2","l2"]:
 
             stream = l1_iter if stream_name=="l1" else l2_iter
+
             batch = [next(stream) for _ in range(BATCH_SIZE)]
 
-            loss = train_step(model, optimizer,
-                              batch, device,
-                              GRAD_ACCUM, step_idx)
+            loss = train_step(
+                model,
+                optimizer,
+                batch,
+                device,
+                GRAD_ACCUM,
+                step_idx
+            )
 
             tokens = BATCH_SIZE * SEQ_LEN * world_size
             tokens_seen_total += tokens
@@ -263,9 +307,10 @@ def train(lang):
                     f"ratio {state['l1_seen']/max(1,state['l2_seen']):.2f}"
                 )
 
-            # checkpoint
-            while (state["checkpoint_idx"] < len(checkpoint_tokens)
-                   and state["l2_seen"] >= checkpoint_tokens[state["checkpoint_idx"]]):
+            while (
+                state["checkpoint_idx"] < len(checkpoint_tokens)
+                and state["l2_seen"] >= checkpoint_tokens[state["checkpoint_idx"]]
+            ):
 
                 pct = int(CHECKPOINT_FRACS[state["checkpoint_idx"]]*100)
                 level = LEVEL_NAMES[state["checkpoint_idx"]]
@@ -274,7 +319,7 @@ def train(lang):
                 os.makedirs(path, exist_ok=True)
 
                 if is_master:
-                    model.module.save_pretrained(path) if is_ddp else model.save_pretrained(path)
+                    (model.module if is_ddp else model).save_pretrained(path)
                     tokenizer.save_pretrained(path)
                     save_state(run_dir, state)
                     push_to_hub(path, lang, state["checkpoint_idx"])
