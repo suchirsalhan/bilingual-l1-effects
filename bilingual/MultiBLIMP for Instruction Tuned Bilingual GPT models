@@ -1,0 +1,67 @@
+!pip install transformers datasets torch tqdm
+
+from datasets import load_dataset
+
+dataset = load_dataset("jumelet/multiblimp", 'spa') #change the language code
+print(dataset)
+print(dataset["train"].features)
+
+print(dataset)
+train = dataset["train"]
+print(dataset["train"][0])
+print(train.column_names)
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model_name = "lgb35/B-GPT-es-fineweb-beginner-alpacaEnglish" #change the model
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+model.eval()
+
+import torch.nn.functional as F
+
+def score_sentence(sentence):
+    inputs = tokenizer(sentence, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+    shift_logits = logits[:, :-1, :]
+    shift_labels = inputs["input_ids"][:, 1:]
+
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+
+    return token_log_probs.sum().item()
+
+from collections import defaultdict
+from tqdm import tqdm
+
+spanish_dataset = dataset["train"] #change the name based on the language
+
+results = defaultdict(lambda: {"correct": 0, "total": 0})
+
+for example in tqdm(spanish_dataset):
+    good_score = score_sentence(example["sen"])
+    bad_score = score_sentence(example["wrong_sen"])
+
+    phenomenon = example["phenomenon"]
+
+    if good_score > bad_score:
+        results[phenomenon]["correct"] += 1
+    results[phenomenon]["total"] += 1
+
+# Compute per-phenomenon accuracies
+phenomenon_acc = {}
+for phen in results:
+    acc = results[phen]["correct"] / results[phen]["total"]
+    phenomenon_acc[phen] = acc
+    print(f"{phen}: {acc:.3f}")
+
+# Compute overall accuracy
+overall_acc = sum(phenomenon_acc.values()) / len(phenomenon_acc)
+print("\nOverall Spanish MultiBLiMP Accuracy:", overall_acc)
