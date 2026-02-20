@@ -1,7 +1,12 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import torch
 
+############################CHANGE###################################
 model_name = "lgb35/B-GPT-es-fineweb-beginner-alpacaEnglish"
+language = "Spanish"
+proficiency = "beginner"
+run_id = 2
+##############################CHANGE#################################
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -90,7 +95,6 @@ for p in prompts:
     output = generator(
         full_prompt,
         max_new_tokens=300,
-        min_new_tokens=250,
         temperature=0.7,
         do_sample=True,
         pad_token_id=tokenizer.eos_token_id
@@ -98,22 +102,27 @@ for p in prompts:
 
     generated_text = output[0]["generated_text"].replace(full_prompt, "").strip()
 
-    results.append({
+    row = {
         "model_name": model_name,
+        "language": language,
+        "proficiency": proficiency,
         "prompt_id": p["prompt_id"],
         "prompt_style": p["prompt_style"],
         "prompt_topic": p["prompt_topic"],
-        "instruction": p["instruction"],
-        "generated_text": generated_text,
+        "run_id": run_id,
         "temperature": 0.7,
-        "max_new_tokens": 300
-    })
+        "max_new_tokens": 300,
+        "generated_text": generated_text,
+    }
 
-import json
+    results.append(row)
 
-filename = "B-GPT-es-fineweb-beginner-alpacaEnglish"
+import pandas as pd
+from datetime import datetime
 
-with open(filename, "w", encoding="utf-8") as f:
-    json.dump(results, f, ensure_ascii=False, indent=4)
+df = pd.DataFrame(results)
 
-print(f"Saved to {filename}")
+output_file = "generations.csv"
+df.to_csv(output_file, index=False, encoding="utf-8")
+
+print(f"Saved to {output_file}")
