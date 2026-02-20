@@ -1,0 +1,119 @@
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import torch
+
+model_name = "lgb35/B-GPT-es-fineweb-beginner-alpacaEnglish"
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Load model
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto" if torch.cuda.is_available() else None
+)
+
+# Create generator
+generator = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer
+)
+
+prompts = [
+    {
+        "prompt_id": "A1",
+        "prompt_style": "basic",
+        "prompt_topic": "hobbies",
+        "instruction": "Your town wants people to take part in different activities and hobbies. Write an article for your local newspaper describing the activities you can do in your town at the weekend."
+    },
+    {
+        "prompt_id": "B1",
+        "prompt_style": "basic",
+        "prompt_topic": "holiday",
+        "instruction": "Your friend, Sophia, has emailed you about her recent holiday. Write an email to her, describing your favourite holiday you have been on."
+    },
+    {
+        "prompt_id": "C1",
+        "prompt_style": "basic",
+        "prompt_topic": "family",
+        "instruction": "Your local magazine is holding a competition for articles about the question ‘Big family or small family’. Write an article about your family. You should include whether you have a big or small family, and which you prefer."
+    },
+    { ###UPDATE FOR L1###
+        "prompt_id": "A2",
+        "prompt_style": "mixed",
+        "prompt_topic": "hobbies",
+        "instruction": "Your town wants people to take part en diversas actividades y aficiones. Write an article para tu periódico local describing the activities you can do in your town durante el fin de semana."
+    },
+    {
+        "prompt_id": "B2",
+        "prompt_style": "mixed",
+        "prompt_topic": "holiday",
+        "instruction": "Tu amiga, Sophia, has emailed you about her recent holiday. Write an email to her, describiéndole tus vacaciones favoritas."
+    },
+    {
+        "prompt_id": "C2",
+        "prompt_style": "mixed",
+        "prompt_topic": "family",
+        "instruction": "Tu revista local is holding a competition for articles about the question ‘Big family or small family’. Escribe un artículo sobre tu familia. You should include whether you have a big or small family, y cuál prefieres."
+    },
+    { ###UPDATE FOR L1###
+        "prompt_id": "A3",
+        "prompt_style": "l2t",
+        "prompt_topic": "hobbies",
+        "instruction": "Your town wants people to take part in different activities and hobbies. Write an article for your local newspaper describing the activities you can do in your town at the weekend. Think in Spanish."
+    },
+    {
+        "prompt_id": "B3",
+        "prompt_style": "l2t",
+        "prompt_topic": "holiday",
+        "instruction": "Your friend, Sophia, has emailed you about her recent holiday. Write an email to her, describing your favourite holiday you have been on. Think in Spanish."
+    },
+    {
+        "prompt_id": "C3",
+        "prompt_style": "l2t",
+        "prompt_topic": "family",
+        "instruction": "Your local magazine is holding a competition for articles about the question ‘Big family or small family’. Write an article about your family. You should include whether you have a big or small family, and which you prefer. Think in Spanish."
+    }
+]
+
+results = []
+
+for p in prompts:
+
+    full_prompt = (
+        "### Instruction:\n"
+        f"{p['instruction']}\n\n"
+        "### Response:\n"
+    )
+
+    output = generator(
+        full_prompt,
+        max_new_tokens=300,
+        min_new_tokens=250,
+        temperature=0.7,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    generated_text = output[0]["generated_text"].replace(full_prompt, "").strip()
+
+    results.append({
+        "model_name": model_name,
+        "prompt_id": p["prompt_id"],
+        "prompt_style": p["prompt_style"],
+        "prompt_topic": p["prompt_topic"],
+        "instruction": p["instruction"],
+        "generated_text": generated_text,
+        "temperature": 0.7,
+        "max_new_tokens": 300
+    })
+
+import json
+
+filename = "B-GPT-es-fineweb-beginner-alpacaEnglish"
+
+with open(filename, "w", encoding="utf-8") as f:
+    json.dump(results, f, ensure_ascii=False, indent=4)
+
+print(f"Saved to {filename}")
