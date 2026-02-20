@@ -13,6 +13,7 @@ HPC
 source demo311/bin/activate
 cd scripts
 bash langs.sh
+bash langs_redpajama.sh
 ```
 
 
