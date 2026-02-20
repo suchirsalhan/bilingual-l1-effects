@@ -6,6 +6,8 @@ dataset = load_dataset("jumelet/multiblimp", 'spa') #change the language code
 print(dataset)
 print(dataset["train"].features)
 
+#Available codes: ['abk', 'aln', 'amh', 'apu', 'aqz', 'arb', 'azz', 'bel', 'ben', 'bho', 'bor', 'bre', 'bua', 'bul', 'cat', 'ces', 'chu', 'cym', 'dan', 'deu', 'egy', 'ell', 'eng', 'est', 'eus', 'fao', 'fas', 'fin', 'fra', 'frm', 'fro', 'gla', 'gle', 'glg', 'got', 'grc', 'guj', 'hbo', 'hbs', 'heb', 'hin', 'hit', 'hsb', 'hun', 'hye', 'hyw', 'isl', 'ita', 'kat', 'kaz', 'kir', 'kmr', 'koi', 'kpv', 'krl', 'kxh', 'lat', 'lav', 'lij', 'lit', 'mar', 'mdf', 'mkd', 'myv', 'nds', 'nhi', 'nld', 'olo', 'orv', 'ota', 'pcm', 'pol', 'por', 'quc', 'ron', 'rus', 'sah', 'san', 'slk', 'slv', 'sme', 'sms', 'spa', 'sqi', 'swe', 'tam', 'tpn', 'ttc', 'tur', 'uig', 'ukr', 'urb', 'urd', 'uzb', 'vep', 'wbp', 'wol', 'xcl', 'xnr', 'xpg', 'yrl']
+
 print(dataset)
 train = dataset["train"]
 print(dataset["train"][0])
