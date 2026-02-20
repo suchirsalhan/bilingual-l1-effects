@@ -66,4 +66,4 @@ for phen in results:
 
 # Compute overall accuracy
 overall_acc = sum(phenomenon_acc.values()) / len(phenomenon_acc)
-print("\nOverall Spanish MultiBLiMP Accuracy:", overall_acc)
+print("\nOverall MultiBLiMP Accuracy:", overall_acc)
