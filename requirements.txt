@@ -1,17 +1,34 @@
-# Core
+# ===============================
+# Core Deep Learning Stack
+# ===============================
+
 torch>=2.1.0
-transformers[torch]>=4.45.0
-datasets[streaming,vision,text]>=2.15.0
-huggingface_hub[cli,requests]>=0.17.0
+transformers>=4.45.0
+datasets>=2.15.0
+huggingface_hub>=0.20.0
+
+# Tokenization
 sentencepiece>=0.1.99
-tokenizers>=0.14.3
-tqdm>=4.66.0
+tokenizers>=0.15.0
+tiktoken>=0.7.0
+
+# Numerics / Utils
 numpy>=1.25.0
-
-# Optional / GPU
-# Uncomment the correct torch version for your CUDA
-# torch==2.1.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
-
-# Utilities
-requests>=2.31.0
+tqdm>=4.66.0
 pyyaml>=6.0
+requests>=2.31.0
+
+# ===============================
+# Distributed + Training Stability
+# (VERY recommended on HPC)
+# ===============================
+
+accelerate>=0.30.0
+packaging>=23.0
+psutil>=5.9.0
+
+# ===============================
+# Optional logging
+# ===============================
+
+wandb>=0.17.0
