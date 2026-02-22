@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast
-from datasets import load_dataset, IterableDataset
+from datasets import load_dataset
 import sentencepiece as spm
 from transformers import GPT2LMHeadModel, GPT2Config, PreTrainedTokenizerFast
 from huggingface_hub import create_repo, upload_folder
@@ -16,19 +16,16 @@ LR = 6e-4
 SEQ_LEN = 512
 BATCH_SIZE = 16
 GRAD_ACCUM = 2
-
 TOTAL_TOKENS = 5_000_000_000
 PHASE1_TOKENS = TOTAL_TOKENS // 2
 L2_TOTAL = int(TOTAL_TOKENS * (1/3))
-
 CHECKPOINT_FRACS = [0.25, 0.5, 0.75, 1.0]
 
 HF_USER = "suchirsalhan"
 SAVE_DIR = "./runs_redpajama"
 TOKENIZER_DIR = "./tokenizer-redpajama"
 STATE_FILE = "trainer_state.json"
-
-LEVEL_NAMES = {0: "beginner",1: "intermediate",2: "advanced",3: "fluent"}
+LEVEL_NAMES = {0:"beginner",1:"intermediate",2:"advanced",3:"fluent"}
 
 # ============================================================
 # DISTRIBUTED SETUP
@@ -52,76 +49,62 @@ def setup_logging(is_master, run_dir):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(message)s",
-        handlers=[
-            logging.FileHandler(os.path.join(run_dir, "training.log")),
-            logging.StreamHandler(),
-        ],
+        handlers=[logging.FileHandler(os.path.join(run_dir,"training.log")), logging.StreamHandler()],
     )
 
 # ============================================================
 # STATE
 # ============================================================
-def default_state():
-    return {"phase":1,"l1_seen":0,"l2_seen":0,"checkpoint_idx":0}
-
+def default_state(): return {"phase":1,"l1_seen":0,"l2_seen":0,"checkpoint_idx":0}
 def load_state(run_dir):
     path = os.path.join(run_dir, STATE_FILE)
     return json.load(open(path)) if os.path.exists(path) else default_state()
-
-def save_state(run_dir, state):
-    json.dump(state, open(os.path.join(run_dir, STATE_FILE), "w"))
+def save_state(run_dir, state): json.dump(state, open(os.path.join(run_dir, STATE_FILE),"w"))
 
 # ============================================================
 # REDPAJAMA FILTER
 # ============================================================
 def gopher_rules_pass(sample):
-    if "quality_signals" not in sample:
-        return True
-    signals = json.loads(sample["quality_signals"])
-    wc = signals["rps_doc_word_count"][0][2]
-    if wc < 50 or wc > 100_000: return False
-    ratio = signals["rps_doc_symbol_to_word_ratio"][0][2]
-    if ratio > 0.1: return False
+    if "quality_signals" not in sample: return True
+    signals=json.loads(sample["quality_signals"])
+    wc=signals["rps_doc_word_count"][0][2]
+    if wc<50 or wc>100_000: return False
+    ratio=signals["rps_doc_symbol_to_word_ratio"][0][2]
+    if ratio>0.1: return False
     return True
 
 # ============================================================
-# STREAMING TOKENIZER TRAINING (TRUE STREAMING)
+# TOKENIZER TRAINING (TEMP FILE)
 # ============================================================
-class StreamingCorpus:
-    """Iterable that yields text lines directly from streaming datasets."""
-    def __init__(self, lang, is_ddp, rank, world_size):
-        self.lang = lang
-        self.is_ddp = is_ddp
-        self.rank = rank
-        self.world_size = world_size
-        self.datasets = [
-            ("uonlp/CulturaX", dict(split="train", lang=lang)),
-            ("togethercomputer/RedPajama-Data-V2", dict(
-                split="train", name="default", partition="head_middle",
-                snapshots=["2023-06"], languages=[lang]
-            ))
-        ]
-
-    def __iter__(self):
-        for dname, config in self.datasets:
-            ds = load_dataset(dname, **config, streaming=True)
-            if self.is_ddp:
-                ds = ds.shard(num_shards=self.world_size, index=self.rank)
-            for ex in ds:
-                text = ex.get("text") or ex.get("raw_content")
-                if text:
-                    yield text.replace("\n"," ")
-
-def train_sentencepiece_streaming(lang, is_ddp, rank):
+def build_tokenizer_corpus(lang, rank, world_size):
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
-    model_prefix = os.path.join(TOKENIZER_DIR, "spm")
+    corpus_file = os.path.join(TOKENIZER_DIR,"all_texts.txt")
+    if rank != 0: return corpus_file
+    logging.info("Building tokenizer corpus (temporary file)...")
+    with open(corpus_file,"w",encoding="utf-8") as f:
+        datasets_to_stream = [
+            ("uonlp/CulturaX", {"split":"train","lang":lang}),
+            ("togethercomputer/RedPajama-Data-V2", {"split":"train","name":"default","partition":"head_middle","snapshots":["2023-06"],"languages":[lang]})
+        ]
+        for dname, cfg in datasets_to_stream:
+            ds = load_dataset(dname, **cfg, streaming=True)
+            if world_size>1: ds = ds.shard(num_shards=world_size,index=rank)
+            for ex in ds:
+                text=ex.get("text") or ex.get("raw_content")
+                if text:
+                    f.write(text.replace("\n"," ")+"\n")
+    logging.info("Tokenizer corpus done.")
+    return corpus_file
 
-    if (not is_ddp) or rank==0:
-        logging.info("Training SentencePiece tokenizer (streaming, no temp file)...")
-        corpus_iter = StreamingCorpus(lang, is_ddp, rank, world_size=1 if not is_ddp else int(os.environ["WORLD_SIZE"]))
-
+def train_sentencepiece(lang, is_ddp, rank, world_size):
+    model_prefix=os.path.join(TOKENIZER_DIR,"spm")
+    model_file=model_prefix+".model"
+    if os.path.exists(model_file): return
+    corpus_file = build_tokenizer_corpus(lang, rank, world_size)
+    if rank==0:
+        logging.info("Training SentencePiece tokenizer...")
         spm.SentencePieceTrainer.train(
-            sentence_iterator=corpus_iter,
+            input=corpus_file,
             model_prefix=model_prefix,
             vocab_size=50000,
             model_type="bpe",
@@ -131,36 +114,25 @@ def train_sentencepiece_streaming(lang, is_ddp, rank):
             pad_id=2,
             unk_id=3
         )
-        # Create HF tokenizer wrapper
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=None,
-            bos_token="<s>",
-            eos_token="</s>",
-            pad_token="<pad>",
-            unk_token="<unk>",
-            sp_model_kwargs={"model_file": model_prefix+".model"},
-        )
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=None,
+            bos_token="<s>", eos_token="</s>", pad_token="<pad>", unk_token="<unk>",
+            sp_model_kwargs={"model_file":model_file})
         tokenizer.save_pretrained(TOKENIZER_DIR)
-    if is_ddp:
-        dist.barrier()
+    if is_ddp: dist.barrier()
     logging.info("Tokenizer ready.")
 
 # ============================================================
-# STREAMING BLOCKS
+# STREAMING BLOCKS RESILIENT
 # ============================================================
-BASE_URL = "https://data.together.xyz/redpajama-data-v2/v1.0.0"
-
+BASE_URL="https://data.together.xyz/redpajama-data-v2/v1.0.0"
 def streaming_blocks(dataset_name, config, rank, world_size, tokenizer, skip_tokens=0):
+    buf, seen=[],0
     if dataset_name!="togethercomputer/RedPajama-Data-V2":
-        ds = load_dataset(dataset_name, config, split="train", streaming=True)
-        if world_size>1:
-            ds = ds.shard(num_shards=world_size,index=rank)
-        buf, seen = [], 0
-        for ex in ds:
-            ids = tokenizer.encode(ex.get("text") or "")
-            if seen + len(ids)<skip_tokens:
-                seen+=len(ids)
-                continue
+        ds=load_dataset(dataset_name, config, split="train", streaming=True)
+        if world_size>1: ds=ds.shard(num_shards=world_size,index=rank)
+        for ex in itertools.cycle(ds):
+            ids=tokenizer.encode(ex.get("text") or "")
+            if seen+len(ids)<skip_tokens: seen+=len(ids); continue
             buf.extend(ids)
             while len(buf)>=SEQ_LEN:
                 yield buf[:SEQ_LEN]
@@ -175,7 +147,6 @@ def streaming_blocks(dataset_name, config, rank, world_size, tokenizer, skip_tok
     listing=session.get(listing_url).text.splitlines()
     listing=listing[rank::world_size]
 
-    buf, seen = [],0
     for shard in itertools.cycle(listing):
         try:
             r=session.get(f"{BASE_URL}/documents/{shard}.json.gz",stream=True,timeout=60)
@@ -183,18 +154,14 @@ def streaming_blocks(dataset_name, config, rank, world_size, tokenizer, skip_tok
                 for line in f:
                     doc=json.loads(line)
                     text=doc.get("raw_content")
-                    if not text or not gopher_rules_pass(doc):
-                        continue
+                    if not text or not gopher_rules_pass(doc): continue
                     ids=tokenizer.encode(text)
-                    if seen+len(ids)<skip_tokens:
-                        seen+=len(ids)
-                        continue
+                    if seen+len(ids)<skip_tokens: seen+=len(ids); continue
                     buf.extend(ids)
                     while len(buf)>=SEQ_LEN:
                         yield buf[:SEQ_LEN]
                         buf=buf[SEQ_LEN:]
-        except:
-            continue
+        except Exception: continue
 
 # ============================================================
 # TRAIN STEP
@@ -230,14 +197,12 @@ def train(lang):
     setup_logging(is_master,run_dir)
     device=f"cuda:{local_rank}"
 
-    # ================= TOKENIZER =================
-    if not os.path.exists(os.path.join(TOKENIZER_DIR,"spm.model")):
-        train_sentencepiece_streaming(lang,is_ddp,global_rank)
-
+    # ---------- TOKENIZER ----------
+    train_sentencepiece(lang,is_ddp,global_rank,world_size)
     tokenizer = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_DIR)
 
-    # ================= MODEL =================
-    config = GPT2Config(
+    # ---------- MODEL ----------
+    config=GPT2Config(
         vocab_size=tokenizer.vocab_size,
         n_positions=SEQ_LEN,
         n_ctx=SEQ_LEN,
@@ -249,23 +214,24 @@ def train(lang):
     )
     model=GPT2LMHeadModel(config).to(device)
     model.gradient_checkpointing_enable()
-    if is_ddp:
-        model = DDP(model, device_ids=[local_rank])
-
+    if is_ddp: model = DDP(model, device_ids=[local_rank])
     optimizer=torch.optim.AdamW(model.parameters(),lr=LR)
+
     state=load_state(run_dir)
 
-    # ================= DATA STREAMS =================
-    l1_iter=iter(streaming_blocks("uonlp/CulturaX",lang,global_rank,world_size,tokenizer,state["l1_seen"]))
-    l2_iter=iter(streaming_blocks("togethercomputer/RedPajama-Data-V2",
+    # ---------- DATA STREAMS ----------
+    l1_iter=streaming_blocks("uonlp/CulturaX",lang,global_rank,world_size,tokenizer,state["l1_seen"])
+    l2_iter=streaming_blocks("togethercomputer/RedPajama-Data-V2",
         dict(partition="head_middle",snapshots=["2023-06"],languages=[lang]),
         global_rank,world_size,tokenizer,state["l2_seen"]
-    ))
+    )
+    l1_iter=iter(itertools.cycle(l1_iter))
+    l2_iter=iter(itertools.cycle(l2_iter))
 
     checkpoint_tokens=[int(L2_TOTAL*x) for x in CHECKPOINT_FRACS]
     step_idx=0
 
-    # ================= PHASE 1 =================
+    # ---------- PHASE 1 ----------
     if state["phase"]==1:
         if is_master: logging.info("Phase1: L1 only")
         while state["l1_seen"]<PHASE1_TOKENS:
@@ -276,7 +242,7 @@ def train(lang):
         state["phase"]=2
         save_state(run_dir,state)
 
-    # ================= PHASE 2 =================
+    # ---------- PHASE 2 ----------
     if is_master: logging.info("Phase2 bilingual")
     while state["l2_seen"]<L2_TOTAL:
         for sname in ["l1","l2","l2"]:
