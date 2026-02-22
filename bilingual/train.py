@@ -12,7 +12,6 @@ from huggingface_hub import create_repo, upload_folder
 # ============================================================
 # CONFIG
 # ============================================================
-
 LR = 6e-4
 SEQ_LEN = 512
 BATCH_SIZE = 16
@@ -29,12 +28,9 @@ SAVE_DIR = "./runs_finewebedu"
 TOKENIZER_DIR = "./tokenizer-finewebedu"
 STATE_FILE = "trainer_state.json"
 
-LEVEL_NAMES = {0: "beginner", 1: "intermediate", 2: "advanced", 3: "fluent"}
-
 # ============================================================
 # DISTRIBUTED
 # ============================================================
-
 def setup_distributed():
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
@@ -46,7 +42,6 @@ def setup_distributed():
 # ============================================================
 # LOGGING
 # ============================================================
-
 def setup_logging(is_master, run_dir):
     if not is_master:
         logging.disable(logging.CRITICAL)
@@ -60,7 +55,6 @@ def setup_logging(is_master, run_dir):
 # ============================================================
 # STATE
 # ============================================================
-
 def default_state():
     return {"phase": 1, "l1_seen": 0, "l2_seen": 0, "checkpoint_idx": 0}
 
@@ -74,7 +68,6 @@ def save_state(run_dir, state):
 # ============================================================
 # TOKENIZER (STREAMING)
 # ============================================================
-
 def sentence_iterator(lang):
     ds1 = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
     for ex in ds1:
@@ -92,26 +85,35 @@ def train_sentencepiece_streaming(lang, is_ddp, global_rank):
     if global_rank == 0:
         os.makedirs(TOKENIZER_DIR, exist_ok=True)
         logging.info("Training SentencePiece tokenizer...")
+
+        # Write streaming data to a temporary file
+        temp_file = os.path.join(TOKENIZER_DIR, "spm_input.txt")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            for sent in sentence_iterator(lang):
+                f.write(sent + "\n")
+
         spm.SentencePieceTrainer.train(
-            sentence_iterator=iter(sentence_iterator(lang)),
+            input=temp_file,
             model_prefix=os.path.join(TOKENIZER_DIR, "spm"),
             vocab_size=50000,
             model_type="bpe",
             character_coverage=1.0,
             bos_id=0, eos_id=1, pad_id=2, unk_id=3,
         )
+        os.remove(temp_file)
+
         tokenizer = PreTrainedTokenizerFast(
             bos_token="<s>", eos_token="</s>", pad_token="<pad>", unk_token="<unk>",
-            sp_model_kwargs={"model_file": model_path},
+            sp_model_file=model_path
         )
         tokenizer.save_pretrained(TOKENIZER_DIR)
+
     if is_ddp:
         dist.barrier()
 
 # ============================================================
 # DATA STREAMING
 # ============================================================
-
 class ResilientStreamingIterator:
     def __init__(self, dataset, config, rank, world_size, tokenizer, skip_tokens=0):
         self.dataset, self.config, self.rank = dataset, config, rank
@@ -122,7 +124,6 @@ class ResilientStreamingIterator:
         return streaming_blocks(self.dataset, self.config, self.rank, self.world_size, self.tokenizer, self.skip_tokens)
 
     def __iter__(self): return self
-
     def __next__(self):
         try:
             return next(self.iterator)
@@ -131,12 +132,12 @@ class ResilientStreamingIterator:
             return next(self.iterator)
 
 def streaming_blocks(dataset, config, rank, world_size, tokenizer, skip_tokens=0):
-    ds = load_dataset(dataset, config, split="train", streaming=True).shard(world_size, rank)
+    ds = load_dataset(dataset, config, split="train", streaming=True).shard(num_shards=world_size, index=rank)
     buf, seen = [], 0
     for ex in ds:
         text = ex.get("text")
         if not text: continue
-        ids = tokenizer.encode(text)
+        ids = tokenizer.encode(text, add_special_tokens=False)
         if seen + len(ids) < skip_tokens:
             seen += len(ids)
             continue
@@ -148,7 +149,6 @@ def streaming_blocks(dataset, config, rank, world_size, tokenizer, skip_tokens=0
 # ============================================================
 # TRAIN STEP
 # ============================================================
-
 def train_step(model, opt, batch, device, step):
     x = torch.tensor(batch, device=device)[:, :-1]
     y = torch.tensor(batch, device=device)[:, 1:]
@@ -161,16 +161,23 @@ def train_step(model, opt, batch, device, step):
     return loss.item() * GRAD_ACCUM
 
 # ============================================================
+# HUB PUSH
+# ============================================================
+def push_to_hub(local_path, lang, idx):
+    repo_name = f"B-GPT-{lang}-fineweb-{idx}"
+    create_repo(repo_name, exist_ok=True, private=False)
+    upload_folder(folder_path=local_path, repo_id=f"{HF_USER}/{repo_name}", repo_type="model")
+
+# ============================================================
 # TRAIN LOOP
 # ============================================================
-
 def train(lang):
     is_ddp, local_rank, global_rank, world_size = setup_distributed()
     is_master = global_rank == 0
     run_dir = os.path.join(SAVE_DIR, lang)
     os.makedirs(run_dir, exist_ok=True)
     setup_logging(is_master, run_dir)
-    device = f"cuda:{local_rank}"
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
     train_sentencepiece_streaming(lang, is_ddp, global_rank)
     tokenizer = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_DIR)
@@ -183,7 +190,7 @@ def train(lang):
     model = GPT2LMHeadModel(config).to(device)
     model.gradient_checkpointing_enable()
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
     state = load_state(run_dir)
@@ -192,7 +199,7 @@ def train(lang):
 
     step = 0
     checkpoint_tokens = [int(L2_TOTAL * x) for x in CHECKPOINT_FRACS]
-    tokens_per_batch = BATCH_SIZE * SEQ_LEN # Each rank sees this many
+    tokens_per_batch = BATCH_SIZE * SEQ_LEN
 
     # PHASE 1
     if state["phase"] == 1:
@@ -236,7 +243,7 @@ def train(lang):
                         logging.error(f"Hub upload failed: {e}")
 
                 state["checkpoint_idx"] += 1
-                if is_ddp: dist.barrier() # Sync all ranks before moving on
+                if is_ddp: dist.barrier()
 
     if is_ddp: dist.destroy_process_group()
     if is_master: logging.info("Training complete.")
