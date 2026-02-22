@@ -55,10 +55,13 @@ which python
 LANG=$1
 shift  # remove first argument from $@ so $@ contains only extra args
 
+# We increase the rdzv timeout to match your 1-hour (3600s) + buffer plan.
+# 'join_timeout' ensures ranks have enough time to find each other even if one is busy.
+
 torchrun \
     --nnodes=1 \
     --nproc-per-node=4 \
     --rdzv-backend=c10d \
     --rdzv-endpoint=localhost:0 \
+    --rdzv-conf="join_timeout=7200,rdzv_timeout=7200,factory_max_retries=1" \
     bilingual/train.py --lang "$LANG" "$@"
-
