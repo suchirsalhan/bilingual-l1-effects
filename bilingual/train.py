@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, json, logging, argparse
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -33,7 +34,8 @@ STATE_FILE = "trainer_state.json"
 # ============================================================
 def setup_distributed():
     if "RANK" in os.environ:
-        dist.init_process_group("nccl")
+        # NCCL timeout set to 120 minutes for large streaming tokenizer
+        dist.init_process_group("nccl", timeout=timedelta(minutes=120))
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         return True, local_rank, int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
@@ -66,7 +68,7 @@ def save_state(run_dir, state):
     json.dump(state, open(os.path.join(run_dir, STATE_FILE), "w"))
 
 # ============================================================
-# TOKENIZER (STREAMING)
+# TOKENIZER (STREAMING DIRECT ITERATOR)
 # ============================================================
 def sentence_iterator(lang):
     ds1 = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
@@ -81,32 +83,36 @@ def sentence_iterator(lang):
 def train_sentencepiece_streaming(lang, is_ddp, global_rank):
     model_path = os.path.join(TOKENIZER_DIR, "spm.model")
     if os.path.exists(model_path):
+        if is_ddp: dist.barrier()
         return
+
     if global_rank == 0:
         os.makedirs(TOKENIZER_DIR, exist_ok=True)
-        logging.info("Training SentencePiece tokenizer...")
+        logging.info("Training tokenizer using Direct Iterator method...")
 
-        # Write streaming data to a temporary file
-        temp_file = os.path.join(TOKENIZER_DIR, "spm_input.txt")
-        with open(temp_file, "w", encoding="utf-8") as f:
-            for sent in sentence_iterator(lang):
-                f.write(sent + "\n")
+        # Wrap the iterator to limit number of sentences (5M) for training
+        def limited_iterator(gen, limit):
+            for i, item in enumerate(gen):
+                if i >= limit: break
+                yield item
 
         spm.SentencePieceTrainer.train(
-            input=temp_file,
+            sentence_iterator=limited_iterator(sentence_iterator(lang), 5_000_000),
             model_prefix=os.path.join(TOKENIZER_DIR, "spm"),
             vocab_size=50000,
             model_type="bpe",
-            character_coverage=1.0,
+            character_coverage=0.9995,
+            byte_fallback=True,
+            num_threads=os.cpu_count(),
             bos_id=0, eos_id=1, pad_id=2, unk_id=3,
         )
-        os.remove(temp_file)
 
         tokenizer = PreTrainedTokenizerFast(
             bos_token="<s>", eos_token="</s>", pad_token="<pad>", unk_token="<unk>",
             sp_model_file=model_path
         )
         tokenizer.save_pretrained(TOKENIZER_DIR)
+        logging.info("Tokenizer training complete and saved.")
 
     if is_ddp:
         dist.barrier()
@@ -179,9 +185,11 @@ def train(lang):
     setup_logging(is_master, run_dir)
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
+    # Train SentencePiece tokenizer streaming method
     train_sentencepiece_streaming(lang, is_ddp, global_rank)
     tokenizer = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_DIR)
 
+    # Model
     config = GPT2Config(
         vocab_size=tokenizer.vocab_size, n_positions=SEQ_LEN, n_ctx=SEQ_LEN,
         n_embd=768, n_layer=12, n_head=12,
@@ -193,6 +201,7 @@ def train(lang):
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
+    # State
     state = load_state(run_dir)
     l1_iter = ResilientStreamingIterator("uonlp/CulturaX", lang, global_rank, world_size, tokenizer, state["l1_seen"])
     l2_iter = ResilientStreamingIterator("HuggingFaceFW/fineweb-edu", "default", global_rank, world_size, tokenizer, state["l2_seen"])
@@ -221,7 +230,7 @@ def train(lang):
             iterator = l1_iter if src == "l1" else l2_iter
             batch = [next(iterator) for _ in range(BATCH_SIZE)]
             loss = train_step(model, optimizer, batch, device, step)
-            
+
             if src == "l2": state["l2_seen"] += tokens_per_batch
             else: state["l1_seen"] += tokens_per_batch
             step += 1
@@ -230,7 +239,6 @@ def train(lang):
             if state["checkpoint_idx"] < len(checkpoint_tokens) and (state["l2_seen"] * world_size) >= checkpoint_tokens[state["checkpoint_idx"]]:
                 pct = int(CHECKPOINT_FRACS[state["checkpoint_idx"]] * 100)
                 path = os.path.join(run_dir, f"checkpoint_{pct}")
-                
                 if is_master:
                     os.makedirs(path, exist_ok=True)
                     (model.module if is_ddp else model).save_pretrained(path)
@@ -241,7 +249,6 @@ def train(lang):
                         push_to_hub(path, lang, state["checkpoint_idx"])
                     except Exception as e:
                         logging.error(f"Hub upload failed: {e}")
-
                 state["checkpoint_idx"] += 1
                 if is_ddp: dist.barrier()
 
