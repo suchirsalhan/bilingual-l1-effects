@@ -1,77 +1,45 @@
 #!/bin/bash
-#
-# SLURM job script for Wilkes3 — 5B-token streaming GPT-2 LM
-# AMD EPYC 7763, ConnectX-6, A100
-# Last updated: Feb 2026
-#
-
 #SBATCH -J bilingual
 #SBATCH -A BUTTERY-SL2-GPU
+#SBATCH -p ampere
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --gpus=4
 #SBATCH --exclusive
 #SBATCH --time=36:00:00
 #SBATCH --mail-type=FAIL
-#SBATCH -p ampere
 
-# ---------------- Environment ----------------
+# ---------------- Modules ----------------
 . /etc/profile.d/modules.sh
 module purge
 module load rhel8/default-amp
-module load python/3.11.0-icl
 
-JOBID=$SLURM_JOB_ID
-export OMP_NUM_THREADS=1
-np=$[${numnodes}*${mpi_tasks_per_node}]
+# ---------------- Paths ----------------
+PROJECT=/rds/user/sas245/hpc-work/bilingual-l1-effects
+VENV=$PROJECT/demo311
 
-echo -e "JobID: $JOBID\n======"
-echo "Time: `date`"
-echo "Running on master node: `hostname`"
-echo "Current directory: `pwd`"
+cd $PROJECT
+source $VENV/bin/activate
 
-
-nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
-nodes_array=($nodes)
-head_node=${nodes_array[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
-port_number=$(shuf -i 29510-49510 -n 1)
-
-echo Node IP: $head_node_ip
-export LOGLEVEL=INFO
-
-#! CD back to root directory
-cd ..
-# Activate Python environment
-source demo311/bin/activate
-python --version
+echo "Host: $(hostname)"
+echo "PWD: $(pwd)"
 which python
+python -V
 
-# ---------------- Distributed config ----------------
-numnodes=$SLURM_JOB_NUM_NODES
-numtasks=$SLURM_NTASKS
-mpi_tasks_per_node=$(echo "$SLURM_TASKS_PER_NODE" | sed -e  's/^\([0-9][0-9]*\).*$/\1/')
-
-nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
-head_node=${nodes[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
-
-# Random port for rendezvous
-port_number=$(shuf -i 29510-49510 -n 1)
-export MASTER_ADDR=$head_node_ip
-export MASTER_PORT=$port_number
-export LOGLEVEL=INFO
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_DEBUG=INFO
+# ---------------- NCCL (Wilkes3 safe) ----------------
 export OMP_NUM_THREADS=1
+export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE=0
+export NCCL_SOCKET_IFNAME=ib0
+export NCCL_P2P_DISABLE=0
+export NCCL_ASYNC_ERROR_HANDLING=1
 
 # ---------------- Training ----------------
 LANG=$1
-shift  # remove first argument so $@ contains extra arguments
+shift
 
 torchrun \
-    --nnodes=$numnodes \
-    --nproc-per-node=4 \
-    --rdzv-backend=c10d \
-    --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
-    --rdzv-conf="join_timeout=7200,rdzv_timeout=7200,factory_max_retries=1" \
-    bilingual/train.py --lang "$LANG" "$@"
+  --standalone \
+  --nproc_per_node=4 \
+  bilingual/train.py \
+  --lang "$LANG" "$@"
