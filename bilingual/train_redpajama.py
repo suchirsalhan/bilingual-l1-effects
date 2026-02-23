@@ -12,21 +12,15 @@ from huggingface_hub import create_repo, upload_folder
 import itertools, gzip, requests
 
 # ================= CONFIG =================
-
 LR = 6e-4
 SEQ_LEN = 512
 BATCH_SIZE = 16
 GRAD_ACCUM = 2
-
 TOTAL_TOKENS = 5_000_000_000
 PHASE1_TOKENS = TOTAL_TOKENS // 2
 L2_TOTAL = int(TOTAL_TOKENS * (1/3))
-
 CHECKPOINT_FRACS = [0.25, 0.5, 0.75, 1.0]
-
-HF_USER = "suchirsalhan"
-TOKENIZER_ORG = "RA-ALTA"
-
+HF_USER = "RA-ALTA"
 SAVE_DIR = "./runs_redpajama"
 STATE_FILE = "trainer_state.json"
 
@@ -65,8 +59,6 @@ def setup_logging(is_master, run_dir):
             logging.StreamHandler(),
         ],
     )
-
-
 # ================= STATE =================
 
 def default_state():
