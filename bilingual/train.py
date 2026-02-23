@@ -8,31 +8,25 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast
 
 from datasets import load_dataset
+# Changed: Import LlamaTokenizer to handle the local .model files
 from transformers import (
     GPT2LMHeadModel,
     GPT2Config,
-    PreTrainedTokenizerFast,
+    LlamaTokenizer,
 )
 from huggingface_hub import create_repo, upload_folder
 
 # ================= CONFIG =================
-
 LR = 6e-4
 SEQ_LEN = 512
 BATCH_SIZE = 16
 GRAD_ACCUM = 2
-
 TOTAL_TOKENS = 5_000_000_000
 PHASE1_TOKENS = TOTAL_TOKENS // 2
 L2_TOTAL = int(TOTAL_TOKENS * (1/3))
-
 CHECKPOINT_FRACS = [0.25, 0.5, 0.75, 1.0]
-
-HF_USER = "suchirsalhan"
-TOKENIZER_ORG = "RA-ALTA"
-
+HF_USER = "RA-ALTA"
 SAVE_DIR = "./runs_finewebedu"
-TOKENIZER_DIR = "./tokenizer_cache"
 STATE_FILE = "trainer_state.json"
 
 # ================= DISTRIBUTED =================
@@ -90,23 +84,40 @@ def save_state(run_dir, state):
     json.dump(state, open(os.path.join(run_dir, STATE_FILE), "w"))
 
 
-# ================= TOKENIZER =================
+# ================= TOKENIZER (LOCAL CHANGE) =================
 
-def load_hf_tokenizer(lang, is_ddp, global_rank):
-    repo_id = f"{TOKENIZER_ORG}/tokenizer-fineweb_{lang}"
+def load_local_tokenizer(lang, is_ddp, global_rank):
+    """
+    Loads the SentencePiece model from ../tokenizers/fineweb_{lang}/
+    relative to the script location in /root/bilingual/
+    """
+    base_script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Jumps from bilingual/ up to root, then into tokenizers/
+    tokenizer_root = os.path.join(base_script_dir, "..", "tokenizers")
+    local_path = os.path.join(tokenizer_root, f"fineweb_{lang}")
+    
+    # Standard SentencePiece model file name
+    model_path = os.path.join(local_path, "spm.model")
 
     if global_rank == 0:
-        logging.info(f"Downloading tokenizer {repo_id}")
-        tok = PreTrainedTokenizerFast.from_pretrained(repo_id)
-        tok.save_pretrained(TOKENIZER_DIR)
+        if not os.path.exists(model_path):
+            logging.error(f"Tokenizer model not found at {model_path}")
+            raise FileNotFoundError(f"Missing spm.model at {model_path}")
+        logging.info(f"Loading local FineWeb tokenizer from {model_path}")
+
+    # Initialize via LlamaTokenizer (best for raw .model files)
+    tokenizer = LlamaTokenizer(vocab_file=model_path, legacy=False)
+
+    # Standardize special tokens for GPT-2 Architecture
+    if tokenizer.bos_token is None:
+        tokenizer.bos_token = "<s>"
+    if tokenizer.eos_token is None:
+        tokenizer.eos_token = "</s>"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     if is_ddp:
         dist.barrier()
-
-    tokenizer = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_DIR)
-
-    if global_rank == 0:
-        logging.info("Tokenizer ready.")
 
     return tokenizer
 
@@ -114,10 +125,16 @@ def load_hf_tokenizer(lang, is_ddp, global_rank):
 # ================= STREAMING DATA =================
 
 def streaming_blocks(dataset, config, rank, world_size, tokenizer, skip_tokens=0):
-    ds = (
-        load_dataset(dataset, config, split="train", streaming=True)
-        .shard(num_shards=world_size, index=rank)
-    )
+    # Determine if we are using CulturaX or FineWeb-Edu for config formatting
+    if isinstance(config, str):
+        # CulturaX uses lang string
+        ds = load_dataset(dataset, config, split="train", streaming=True)
+    else:
+        # FineWeb-Edu might use a dict or "default"
+        ds = load_dataset(dataset, name="default", split="train", streaming=True)
+
+    if world_size > 1:
+        ds = ds.shard(num_shards=world_size, index=rank)
 
     buf, seen = [], 0
 
@@ -176,7 +193,7 @@ def train_step(model, opt, batch, device, step):
 # ================= HUB =================
 
 def push_to_hub(local_path, lang, idx):
-    repo_name = f"B-GPT-{lang}-fineweb-{idx}"
+    repo_name = f"B-GPT-{lang}-fineweb-edu-checkpoint-{idx}"
 
     create_repo(repo_name, exist_ok=True, private=False)
 
@@ -199,8 +216,8 @@ def train(lang):
 
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
-    # -------- Tokenizer --------
-    tokenizer = load_hf_tokenizer(lang, is_ddp, global_rank)
+    # -------- Tokenizer (UPDATED TO LOCAL) --------
+    tokenizer = load_local_tokenizer(lang, is_ddp, global_rank)
 
     # -------- Model --------
     config = GPT2Config(
@@ -279,7 +296,10 @@ def train(lang):
         for src in ["l1", "l2", "l2"]:
 
             iterator = l1_iter if src == "l1" else l2_iter
-            batch = [next(iterator) for _ in range(BATCH_SIZE)]
+            try:
+                batch = [next(iterator) for _ in range(BATCH_SIZE)]
+            except StopIteration:
+                continue
 
             loss = train_step(model, optimizer, batch, device, step)
 
@@ -304,11 +324,12 @@ def train(lang):
                     os.makedirs(path, exist_ok=True)
 
                     (model.module if is_ddp else model).save_pretrained(path)
+                    
+                    # This saves the local tokenizer into the HF format inside the checkpoint
                     tokenizer.save_pretrained(path)
 
                     save_state(run_dir, state)
-
-                    logging.info(f"Saved checkpoint {pct}%")
+                    logging.info(f"Saved checkpoint {pct}% with local tokenizer files.")
 
                     try:
                         push_to_hub(path, lang, state["checkpoint_idx"])
