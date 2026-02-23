@@ -7,7 +7,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast
 from datasets import load_dataset
 import sentencepiece as spm
-from transformers import GPT2LMHeadModel, GPT2Config, PreTrainedTokenizerFast
+from transformers import GPT2LMHeadModel, GPT2Config, PreTrainedTokenizerFast, LlamaTokenizer
 from huggingface_hub import create_repo, upload_folder
 import itertools, gzip, requests
 
@@ -28,8 +28,6 @@ HF_USER = "suchirsalhan"
 TOKENIZER_ORG = "RA-ALTA"
 
 SAVE_DIR = "./runs_redpajama"
-TOKENIZER_DIR = "./tokenizer-redpajama"
-
 STATE_FILE = "trainer_state.json"
 
 LEVEL_NAMES = {
@@ -98,25 +96,40 @@ def gopher_rules_pass(sample):
 
 
 # =========================================================
-# TOKENIZER CHANGE (HF LOAD INSTEAD OF TRAINING)
+# TOKENIZER CHANGE (LOCAL LOAD FROM ADJACENT DIR)
 # =========================================================
 
-def load_hf_tokenizer(lang,is_ddp,global_rank):
+def load_local_tokenizer(lang, is_ddp, global_rank):
+    """
+    Loads the SentencePiece model from ../tokenizers/redpajama_{lang}/
+    relative to the script location in /root/bilingual/
+    """
+    # Navigating from root/bilingual/ to root/tokenizers/
+    base_script_dir = os.path.dirname(os.path.abspath(__file__))
+    tokenizer_root = os.path.join(base_script_dir, "..", "tokenizers")
+    local_path = os.path.join(tokenizer_root, f"redpajama_{lang}")
+    model_path = os.path.join(local_path, "spm.model")
 
-    repo_id=f"{TOKENIZER_ORG}/tokenizer-redpajama_{lang}"
+    if global_rank == 0:
+        if not os.path.exists(model_path):
+            # Fallback check for absolute path from root if script is moved
+            logging.error(f"Tokenizer not found at {model_path}")
+            raise FileNotFoundError(f"Missing spm.model at {model_path}")
+        logging.info(f"Successfully located local tokenizer at {model_path}")
 
-    if global_rank==0:
-        logging.info(f"Downloading tokenizer {repo_id}")
+    # Initialize via LlamaTokenizer (best for raw .model files)
+    tokenizer = LlamaTokenizer(vocab_file=model_path, legacy=False)
 
-        tok=PreTrainedTokenizerFast.from_pretrained(repo_id)
-        tok.save_pretrained(TOKENIZER_DIR)
-
-        logging.info("Tokenizer downloaded and cached.")
+    # Standardize special tokens for GPT-2 Architecture
+    if tokenizer.bos_token is None:
+        tokenizer.bos_token = "<s>"
+    if tokenizer.eos_token is None:
+        tokenizer.eos_token = "</s>"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     if is_ddp:
         dist.barrier()
-
-    tokenizer=PreTrainedTokenizerFast.from_pretrained(TOKENIZER_DIR)
 
     return tokenizer
 
@@ -271,7 +284,7 @@ def train(lang):
     device=f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
     # ---------- TOKENIZER ----------
-    tokenizer=load_hf_tokenizer(lang,is_ddp,global_rank)
+    tokenizer=load_local_tokenizer(lang,is_ddp,global_rank)
 
     # ---------- MODEL ----------
     config=GPT2Config(
@@ -344,8 +357,11 @@ def train(lang):
 
         for src in ["l1","l2","l2"]:
 
-            iterator=l1_iter if src=="l1" else l2_iter
-            batch=[next(iterator) for _ in range(BATCH_SIZE)]
+            try:
+                iterator=l1_iter if src=="l1" else l2_iter
+                batch=[next(iterator) for _ in range(BATCH_SIZE)]
+            except StopIteration:
+                continue
 
             loss=train_step(model,optimizer,batch,device,step)
 
@@ -368,11 +384,14 @@ def train(lang):
                     os.makedirs(path,exist_ok=True)
 
                     (model.module if is_ddp else model).save_pretrained(path)
+                    
+                    # This ensures the local tokenizer is saved into the checkpoint 
+                    # folder before pushing to the hub
                     tokenizer.save_pretrained(path)
 
                     save_state(run_dir,state)
 
-                    logging.info(f"Saved checkpoint {pct}%")
+                    logging.info(f"Saved checkpoint {pct}% with local tokenizer files.")
 
                     try:
                         push_to_hub(path,lang,state["checkpoint_idx"])
