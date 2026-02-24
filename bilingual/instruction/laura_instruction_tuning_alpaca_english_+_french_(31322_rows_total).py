@@ -79,7 +79,7 @@ print(alpaca_english.column_names)
 import unicodedata
 
 def normalize_example(example):
-    for col in ["instruction", "input", "response"]:
+    for col in ["instruction", "input", "output"]:
         if col in example and example[col] is not None:
             example[col] = unicodedata.normalize("NFKC", example[col])
     return example
