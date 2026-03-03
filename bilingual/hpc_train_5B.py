@@ -3,6 +3,7 @@
 End-to-End Bilingual Pretraining with Pre-Tokenized Datasets
 
 Single-language CLI mode: --lang LANG
+DDP-ready for multi-GPU (torchrun)
 """
 
 import os, time, math, json
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import torch
 from torch import optim
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import GPT2Config, GPT2LMHeadModel
 from datasets import load_dataset
 from huggingface_hub import HfApi, create_repo, upload_folder
@@ -64,7 +66,10 @@ MODEL_REPOS = {
 # LOGGING
 # ==========================================================
 
-def log(lang, msg):
+def log(lang, msg, local_rank=0):
+    """Only rank 0 writes logs to avoid duplication"""
+    if local_rank != 0:
+        return
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line)
@@ -100,7 +105,10 @@ def load_state(path):
             return json.load(f)
     return None
 
-def push_model(repo_id, cp_path):
+def push_model(repo_id, cp_path, local_rank=0):
+    """Only rank 0 pushes to HF hub"""
+    if local_rank != 0:
+        return
     for attempt in range(5):
         try:
             create_repo(repo_id, exist_ok=True, token=HF_TOKEN)
@@ -109,23 +117,28 @@ def push_model(repo_id, cp_path):
                 repo_id=repo_id,
                 token=HF_TOKEN
             )
-            log(cp_path.name.split('-')[0], f"✅ Pushed checkpoint to {repo_id}")
+            log(cp_path.name.split('-')[0], f"✅ Pushed checkpoint to {repo_id}", local_rank)
             return
         except Exception as e:
-            log(cp_path.name.split('-')[0], f"⚠️ Failed push attempt {attempt+1} to {repo_id}: {e}")
+            log(cp_path.name.split('-')[0], f"⚠️ Failed push attempt {attempt+1} to {repo_id}: {e}", local_rank)
             time.sleep(60)
-    log(cp_path.name.split('-')[0], f"❌ Giving up on pushing {cp_path}")
+    log(cp_path.name.split('-')[0], f"❌ Giving up on pushing {cp_path}", local_rank)
 
 # ==========================================================
 # TRAINING LOOP
 # ==========================================================
 
-def train_pair(l1, l2, gpu=0):
-    device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
+def train_pair(l1, l2="en"):
+    """DDP-aware training loop"""
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
     phase1_tokens, phase2_tokens = compute_phase_tokens(TOTAL_TOKENS)
     total_training_tokens = TOTAL_TOKENS
     warmup_tokens = int(total_training_tokens * WARMUP_FRACTION)
 
+    # Model + DDP
     model = GPT2LMHeadModel(
         GPT2Config(
             vocab_size=VOCAB_SIZE,
@@ -138,7 +151,7 @@ def train_pair(l1, l2, gpu=0):
             pad_token_id=2
         )
     ).to(device)
-    model.train()
+    model = DDP(model, device_ids=[local_rank])
 
     optimizer = optim.AdamW(model.parameters(), lr=LR_MAX)
     scaler = torch.cuda.amp.GradScaler()
@@ -148,9 +161,9 @@ def train_pair(l1, l2, gpu=0):
     resume = load_state(state_path)
     tokens_global = tokens_l1 = tokens_l2 = next_cp_idx = 0
     if resume:
-        log(l1, "Resuming from checkpoint")
-        model.load_state_dict(torch.load(resume["model_path"]))
-        optimizer.load_state_dict(torch.load(resume["optim_path"]))
+        log(l1, "Resuming from checkpoint", local_rank)
+        model.module.load_state_dict(torch.load(resume["model_path"], map_location=device))
+        optimizer.load_state_dict(torch.load(resume["optim_path"], map_location=device))
         tokens_global = resume["tokens_global"]
         tokens_l1 = resume["tokens_l1"]
         tokens_l2 = resume["tokens_l2"]
@@ -159,7 +172,7 @@ def train_pair(l1, l2, gpu=0):
     # Push old checkpoints
     for cp in CHECKPOINT_DIR.glob(f"{l1}-*"):
         if cp.is_dir():
-            push_model(MODEL_REPOS[l1], cp)
+            push_model(MODEL_REPOS[l1], cp, local_rank)
 
     start_time = time.time()
     accum = 0
@@ -181,7 +194,7 @@ def train_pair(l1, l2, gpu=0):
                 accum += 1
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    log(l1, "⚠️ OOM — skipping batch")
+                    log(l1, "⚠️ OOM — skipping batch", local_rank)
                     torch.cuda.empty_cache()
                     continue
                 else:
@@ -195,13 +208,13 @@ def train_pair(l1, l2, gpu=0):
             tokens_global += block_tokens
             elapsed = time.time() - start_time
             tok_sec = tokens_global / max(elapsed, 1)
-            log(l1, f"Shard:{shard_idx} | {tokens_global/1e9:.2f}B tok | {tok_sec:,.0f} tok/s | LR {LR_MAX:.2e}")
+            log(l1, f"Shard:{shard_idx} | {tokens_global/1e9:.2f}B tok | {tok_sec:,.0f} tok/s | LR {LR_MAX:.2e}", local_rank)
             if tokens_l1 >= phase1_tokens:
                 break
-    log(l1, "Phase 1 complete")
+    log(l1, "Phase 1 complete", local_rank)
 
     # ----------------------
-    # Phase 2: Interleaved L1:L2 (default L2=en)
+    # Phase 2: Interleaved L1:L2
     # ----------------------
     total_l2_tokens = int(phase2_tokens * 2/3)
     total_l1_tokens = phase2_tokens - total_l2_tokens
@@ -225,7 +238,7 @@ def train_pair(l1, l2, gpu=0):
                 accum += 1
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    log(l1, "⚠️ OOM — skipping batch")
+                    log(l1, "⚠️ OOM — skipping batch", local_rank)
                     torch.cuda.empty_cache()
                     continue
                 else:
@@ -251,7 +264,7 @@ def train_pair(l1, l2, gpu=0):
             # Logging
             elapsed = time.time() - start_time
             tok_sec = tokens_global / max(elapsed, 1)
-            log(l1, f"Shard:{shard_idx} | {tokens_global/1e9:.2f}B tok | {tok_sec:,.0f} tok/s | LR {lr:.2e}")
+            log(l1, f"Shard:{shard_idx} | {tokens_global/1e9:.2f}B tok | {tok_sec:,.0f} tok/s | LR {lr:.2e}", local_rank)
 
             # Logarithmic checkpointing
             if next_cp_idx < len(CHECKPOINT_PERCENTAGES):
@@ -260,25 +273,27 @@ def train_pair(l1, l2, gpu=0):
                     cp_name = f"{l1}-en-{int(CHECKPOINT_PERCENTAGES[next_cp_idx]*100)}"
                     cp_path = CHECKPOINT_DIR / cp_name
                     cp_path.mkdir(parents=True, exist_ok=True)
-                    torch.save(model.state_dict(), cp_path/"model.pt")
-                    torch.save(optimizer.state_dict(), cp_path/"optim.pt")
-                    save_state(state_path,{
-                        "model_path": str(cp_path/"model.pt"),
-                        "optim_path": str(cp_path/"optim.pt"),
-                        "tokens_global": tokens_global,
-                        "tokens_l1": tokens_l1,
-                        "tokens_l2": tokens_l2,
-                        "next_cp_idx": next_cp_idx+1
-                    })
-                    push_model(MODEL_REPOS[l1], cp_path)
+                    if local_rank == 0:
+                        torch.save(model.module.state_dict(), cp_path/"model.pt")
+                        torch.save(optimizer.state_dict(), cp_path/"optim.pt")
+                        save_state(state_path,{
+                            "model_path": str(cp_path/"model.pt"),
+                            "optim_path": str(cp_path/"optim.pt"),
+                            "tokens_global": tokens_global,
+                            "tokens_l1": tokens_l1,
+                            "tokens_l2": tokens_l2,
+                            "next_cp_idx": next_cp_idx+1
+                        })
+                        push_model(MODEL_REPOS[l1], cp_path, local_rank)
                     next_cp_idx += 1
 
     # Final model push
-    final_path = CHECKPOINT_DIR / f"{l1}-final"
-    final_path.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), final_path/"model.pt")
-    push_model(MODEL_REPOS[l1], final_path)
-    log(l1, "Training complete! Final model pushed.")
+    if local_rank == 0:
+        final_path = CHECKPOINT_DIR / f"{l1}-final"
+        final_path.mkdir(parents=True, exist_ok=True)
+        torch.save(model.module.state_dict(), final_path/"model.pt")
+        push_model(MODEL_REPOS[l1], final_path, local_rank)
+        log(l1, "Training complete! Final model pushed.", local_rank)
 
 # ==========================================================
 # ENTRYPOINT
@@ -288,11 +303,11 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--lang", required=True, help="Language code for training")
-    parser.add_argument("--gpu", type=int, default=0, help="CUDA device index")
     args = parser.parse_args()
 
-    # Single-language mode
-    train_pair(args.lang, "en", gpu=args.gpu)
+    # Initialize DDP
+    torch.distributed.init_process_group(backend="nccl")
+    train_pair(args.lang)
 
 if __name__ == "__main__":
     main()
