@@ -1,186 +1,115 @@
 #!/usr/bin/env python3
-import os, json, logging, argparse
-from datetime import timedelta
-
+import os, json, math, logging
+from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast
-
 from datasets import load_dataset
-# Changed: Import LlamaTokenizer to handle the local .model files
-from transformers import (
-    GPT2LMHeadModel,
-    GPT2Config,
-    LlamaTokenizer,
-)
+from transformers import GPT2LMHeadModel, GPT2Config
 from huggingface_hub import create_repo, upload_folder
 
 # ================= CONFIG =================
-LR = 6e-4
+HF_USER = "RA-ALTA"
+SAVE_DIR = Path("./runs_bilingual_5B")
+STATE_FILE = "trainer_state.json"
+
 SEQ_LEN = 512
 BATCH_SIZE = 16
 GRAD_ACCUM = 2
 TOTAL_TOKENS = 5_000_000_000
-PHASE1_TOKENS = TOTAL_TOKENS // 2
-L2_TOTAL = int(TOTAL_TOKENS * (1/3))
+
+PHASE1_FRACTION = 0.5
+PHASE2_FRACTION = 0.5
+L1_RATIO_PHASE2 = 1/3
+L2_RATIO_PHASE2 = 2/3
 CHECKPOINT_FRACS = [0.25, 0.5, 0.75, 1.0]
-HF_USER = "RA-ALTA"
-SAVE_DIR = "./runs_finewebedu"
-STATE_FILE = "trainer_state.json"
 
-# ================= DISTRIBUTED =================
-
-def setup_distributed():
-    if "RANK" in os.environ:
-        dist.init_process_group(
-            backend="nccl",
-            timeout=timedelta(minutes=120),
-        )
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-
-        return (
-            True,
-            local_rank,
-            int(os.environ["RANK"]),
-            int(os.environ["WORLD_SIZE"]),
-        )
-
-    return False, 0, 0, 1
-
+# Languages
+L1_LANGS = ["es","fr","de","pl","tr","ar","zh"]
+L2_LANG = "en"
 
 # ================= LOGGING =================
-
 def setup_logging(is_master, run_dir):
     if not is_master:
         logging.disable(logging.CRITICAL)
         return
-
     os.makedirs(run_dir, exist_ok=True)
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(message)s",
         handlers=[
-            logging.FileHandler(os.path.join(run_dir, "training.log")),
-            logging.StreamHandler(),
-        ],
+            logging.FileHandler(run_dir / "training.log"),
+            logging.StreamHandler()
+        ]
     )
 
-
 # ================= STATE =================
-
 def default_state():
-    return {"phase": 1, "l1_seen": 0, "l2_seen": 0, "checkpoint_idx": 0}
-
+    return {"phase":1, "l1_seen":0, "l2_seen":0, "checkpoint_idx":0}
 
 def load_state(run_dir):
-    path = os.path.join(run_dir, STATE_FILE)
-    return json.load(open(path)) if os.path.exists(path) else default_state()
-
+    path = run_dir / STATE_FILE
+    return json.load(open(path)) if path.exists() else default_state()
 
 def save_state(run_dir, state):
-    json.dump(state, open(os.path.join(run_dir, STATE_FILE), "w"))
+    with open(run_dir / STATE_FILE, "w") as f:
+        json.dump(state, f)
 
+# ================= DATA HELPERS =================
+def get_dataset_name(lang):
+    return f"{HF_USER}/{lang}-5B"
 
-# ================= TOKENIZER (LOCAL CHANGE) =================
+def arrow_shard_iterator(dataset_name, max_tokens=None, is_master=True):
+    ds = load_dataset(dataset_name, split="train", streaming=True)
+    # Approx 650 shards in dataset
+    ds_size = 5_000_000_000
+    num_shards = 650
+    tokens_per_shard = ds_size // num_shards
 
-def load_local_tokenizer(lang, is_ddp, global_rank):
-    """
-    Loads the SentencePiece model from ../tokenizers/fineweb_{lang}/
-    relative to the script location in /root/bilingual/
-    """
-    base_script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Jumps from bilingual/ up to root, then into tokenizers/
-    tokenizer_root = os.path.join(base_script_dir, "..", "tokenizers")
-    local_path = os.path.join(tokenizer_root, f"fineweb_{lang}")
-    
-    # Standard SentencePiece model file name
-    model_path = os.path.join(local_path, "spm.model")
+    tokens_seen = 0
+    shard_count = 0
+    shard_tokens_seen = 0
 
-    if global_rank == 0:
-        if not os.path.exists(model_path):
-            logging.error(f"Tokenizer model not found at {model_path}")
-            raise FileNotFoundError(f"Missing spm.model at {model_path}")
-        logging.info(f"Loading local FineWeb tokenizer from {model_path}")
+    for row in ds:
+        token_ids = row["input_ids"]
+        if max_tokens is not None and tokens_seen + len(token_ids) > max_tokens:
+            token_ids = token_ids[:max_tokens - tokens_seen]
+        tokens_seen += len(token_ids)
+        shard_tokens_seen += len(token_ids)
+        yield token_ids
 
-    # Initialize via LlamaTokenizer (best for raw .model files)
-    tokenizer = LlamaTokenizer(vocab_file=model_path, legacy=False)
+        if shard_tokens_seen >= tokens_per_shard:
+            shard_count += 1
+            shard_tokens_seen = 0
+            if is_master:
+                logging.info(f"[{dataset_name}] Shards processed: {shard_count}/{num_shards} | Tokens seen: {tokens_seen:,}")
+        
+        if max_tokens is not None and tokens_seen >= max_tokens:
+            if is_master:
+                logging.info(f"[{dataset_name}] Reached max_tokens limit: {tokens_seen:,}")
+            break
 
-    # Standardize special tokens for GPT-2 Architecture
-    if tokenizer.bos_token is None:
-        tokenizer.bos_token = "<s>"
-    if tokenizer.eos_token is None:
-        tokenizer.eos_token = "</s>"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if is_ddp:
-        dist.barrier()
-
-    return tokenizer
-
-
-# ================= STREAMING DATA =================
-
-def streaming_blocks(dataset, config, rank, world_size, tokenizer, skip_tokens=0):
-    # Determine if we are using CulturaX or FineWeb-Edu for config formatting
-    if isinstance(config, str):
-        # CulturaX uses lang string
-        ds = load_dataset(dataset, config, split="train", streaming=True)
-    else:
-        # FineWeb-Edu might use a dict or "default"
-        ds = load_dataset(dataset, name="default", split="train", streaming=True)
-
-    if world_size > 1:
-        ds = ds.shard(num_shards=world_size, index=rank)
-
-    buf, seen = [], 0
-
-    for ex in ds:
-        text = ex.get("text")
-        if not text:
-            continue
-
-        ids = tokenizer.encode(text, add_special_tokens=False)
-
-        if seen + len(ids) < skip_tokens:
-            seen += len(ids)
-            continue
-
-        buf.extend(ids)
-
-        while len(buf) >= SEQ_LEN:
-            yield buf[:SEQ_LEN]
-            buf = buf[SEQ_LEN:]
-
-
-class ResilientStreamingIterator:
-    def __init__(self, dataset, config, rank, world_size, tokenizer, skip_tokens=0):
-        self.args = (dataset, config, rank, world_size, tokenizer, skip_tokens)
-        self.iterator = streaming_blocks(*self.args)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        try:
-            return next(self.iterator)
-        except StopIteration:
-            self.iterator = streaming_blocks(*self.args)
-            return next(self.iterator)
-
+def interleave_stream(l1_stream, l2_stream, l1_ratio=1, l2_ratio=2):
+    while True:
+        for _ in range(l1_ratio):
+            try:
+                yield next(l1_stream), "L1"
+            except StopIteration:
+                return
+        for _ in range(l2_ratio):
+            try:
+                yield next(l2_stream), "L2"
+            except StopIteration:
+                return
 
 # ================= TRAIN STEP =================
-
 def train_step(model, opt, batch, device, step):
     x = torch.tensor(batch, device=device)[:, :-1]
     y = torch.tensor(batch, device=device)[:, 1:]
 
     with autocast("cuda", dtype=torch.bfloat16):
         loss = model(x, labels=y).loss / GRAD_ACCUM
-
     loss.backward()
 
     if (step + 1) % GRAD_ACCUM == 0:
@@ -189,170 +118,131 @@ def train_step(model, opt, batch, device, step):
 
     return loss.item() * GRAD_ACCUM
 
-
-# ================= HUB =================
-
-def push_to_hub(local_path, lang, idx):
-    repo_name = f"B-GPT-{lang}-fineweb-edu-checkpoint-{idx}"
-
-    create_repo(repo_name, exist_ok=True, private=False)
-
+# ================= HUGGINGFACE PUSH =================
+def push_checkpoint_to_hf(lang, checkpoint_dir):
+    repo_name = f"bilingual-{lang}-gpt2-5B"
+    try:
+        create_repo(repo_id=f"{HF_USER}/{repo_name}", exist_ok=True)
+    except Exception:
+        pass
     upload_folder(
-        folder_path=local_path,
+        folder_path=str(checkpoint_dir),
         repo_id=f"{HF_USER}/{repo_name}",
         repo_type="model",
+        path_in_repo=checkpoint_dir.name,
+        ignore_patterns=["*.lock", "*.tmp"]
     )
 
+# ================= TRAINING =================
+def train_language():
+    # Get rank and device from torchrun env
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    is_master = local_rank == 0
+    device = f"cuda:{local_rank}"
 
-# ================= TRAIN LOOP =================
-
-def train(lang):
-
-    is_ddp, local_rank, global_rank, world_size = setup_distributed()
-    is_master = global_rank == 0
-
-    run_dir = os.path.join(SAVE_DIR, lang)
+    # Assign L1 language to this process
+    lang = L1_LANGS[local_rank]
+    run_dir = SAVE_DIR / lang
     setup_logging(is_master, run_dir)
 
-    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
-
-    # -------- Tokenizer (UPDATED TO LOCAL) --------
-    tokenizer = load_local_tokenizer(lang, is_ddp, global_rank)
-
-    # -------- Model --------
+    # MODEL
+    vocab_size = 50000
     config = GPT2Config(
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=vocab_size,
         n_positions=SEQ_LEN,
         n_ctx=SEQ_LEN,
-        n_embd=768,
-        n_layer=12,
-        n_head=12,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        n_embd=1024,
+        n_layer=24,
+        n_head=16,
+        bos_token_id=0,
+        eos_token_id=1,
     )
-
     model = GPT2LMHeadModel(config).to(device)
     model.gradient_checkpointing_enable()
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
 
-    if is_ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-
-    # -------- Resume State --------
+    # STATE
     state = load_state(run_dir)
 
-    l1_iter = ResilientStreamingIterator(
-        "uonlp/CulturaX",
-        lang,
-        global_rank,
-        world_size,
-        tokenizer,
-        state["l1_seen"],
-    )
+    # PHASE 1: L1 only
+    phase1_tokens = int(TOTAL_TOKENS * PHASE1_FRACTION)
+    l1_dataset_name = get_dataset_name(lang)
+    if state["phase"] == 1:
+        if is_master: logging.info(f"[{lang}] Phase 1: L1 only")
+        l1_stream = arrow_shard_iterator(l1_dataset_name, max_tokens=phase1_tokens, is_master=is_master)
+        step = 0
+        tokens_seen = 0
+        while True:
+            batch = []
+            try:
+                for _ in range(BATCH_SIZE):
+                    batch += next(l1_stream)[:SEQ_LEN]
+            except StopIteration:
+                break
+            if not batch: break
+            train_step(model, optimizer, [batch], device, step)
+            tokens_seen += len(batch)
+            step += 1
+            state["l1_seen"] = tokens_seen
+            if is_master and tokens_seen % 100_000 == 0:
+                ckpt_path = run_dir / f"phase1_tokens_{tokens_seen//1000}k"
+                ckpt_path.mkdir(exist_ok=True)
+                model.module.save_pretrained(ckpt_path)
+                push_checkpoint_to_hf(lang, ckpt_path)
+                logging.info(f"[{lang}] Phase1 checkpoint at {tokens_seen} tokens")
+            if is_master and step % 50 == 0:
+                logging.info(f"[{lang}] Phase1 Step {step} | Tokens seen {tokens_seen:,}")
+        state["phase"] = 2
+        if is_master: save_state(run_dir, state)
 
-    l2_iter = ResilientStreamingIterator(
-        "HuggingFaceFW/fineweb-edu",
-        "default",
-        global_rank,
-        world_size,
-        tokenizer,
-        state["l2_seen"],
-    )
+    # PHASE 2: Interleaved L1:L2
+    phase2_tokens = int(TOTAL_TOKENS * PHASE2_FRACTION)
+    l1_tokens_phase2 = int(phase2_tokens * L1_RATIO_PHASE2)
+    l2_tokens_phase2 = int(phase2_tokens * L2_RATIO_PHASE2)
 
-    tokens_per_batch = BATCH_SIZE * SEQ_LEN
-    checkpoint_tokens = [int(L2_TOTAL * x) for x in CHECKPOINT_FRACS]
+    l1_stream = arrow_shard_iterator(get_dataset_name(lang), max_tokens=l1_tokens_phase2, is_master=is_master)
+    l2_stream = arrow_shard_iterator(get_dataset_name(L2_LANG), max_tokens=l2_tokens_phase2, is_master=is_master)
+    interleaved = interleave_stream(l1_stream, l2_stream, l1_ratio=1, l2_ratio=2)
 
     step = 0
+    state["checkpoint_idx"] = 0
+    checkpoint_tokens = [int(frac * l2_tokens_phase2) for frac in CHECKPOINT_FRACS]
 
-    # ================= PHASE 1 =================
-    if state["phase"] == 1:
-        if is_master:
-            logging.info("Starting Phase 1")
+    l1_seen = state.get("l1_seen",0)
+    l2_seen = state.get("l2_seen",0)
 
-        while (state["l1_seen"] * world_size) < PHASE1_TOKENS:
+    for token_batch, tag in interleaved:
+        batch = [token_batch[:SEQ_LEN] for _ in range(BATCH_SIZE)]
+        train_step(model, optimizer, batch, device, step)
+        if tag=="L2": l2_seen += BATCH_SIZE*SEQ_LEN
+        else: l1_seen += BATCH_SIZE*SEQ_LEN
+        step += 1
 
-            batch = [next(l1_iter) for _ in range(BATCH_SIZE)]
-            loss = train_step(model, optimizer, batch, device, step)
+        # regular checkpointing every 100k tokens
+        total_seen = l1_seen + l2_seen
+        if is_master and total_seen % 100_000 == 0:
+            ckpt_path = run_dir / f"phase2_tokens_{total_seen//1000}k"
+            ckpt_path.mkdir(exist_ok=True)
+            model.module.save_pretrained(ckpt_path)
+            push_checkpoint_to_hf(lang, ckpt_path)
+            logging.info(f"[{lang}] Phase2 checkpoint at {total_seen} tokens")
 
-            state["l1_seen"] += tokens_per_batch
-            step += 1
+        # curriculum checkpoints
+        if state["checkpoint_idx"] < len(checkpoint_tokens) and l2_seen >= checkpoint_tokens[state["checkpoint_idx"]]:
+            pct = int(CHECKPOINT_FRACS[state["checkpoint_idx"]]*100)
+            path = run_dir / f"checkpoint_{pct}"
+            if is_master:
+                path.mkdir(exist_ok=True)
+                model.module.save_pretrained(path)
+                push_checkpoint_to_hf(lang, path)
+                logging.info(f"[{lang}] Saved checkpoint {pct}% L2 coverage")
+            state["checkpoint_idx"] += 1
 
-            if is_master and step % 50 == 0:
-                logging.info(
-                    f"P1 Step {step} | Tokens {state['l1_seen']*world_size} | Loss {loss:.3f}"
-                )
+    dist.destroy_process_group()
+    if is_master: logging.info(f"[{lang}] Training complete.")
 
-        state["phase"] = 2
-        if is_master:
-            save_state(run_dir, state)
-
-    # ================= PHASE 2 =================
-    if is_master:
-        logging.info("Starting Phase 2")
-
-    while (state["l2_seen"] * world_size) < L2_TOTAL:
-
-        for src in ["l1", "l2", "l2"]:
-
-            iterator = l1_iter if src == "l1" else l2_iter
-            try:
-                batch = [next(iterator) for _ in range(BATCH_SIZE)]
-            except StopIteration:
-                continue
-
-            loss = train_step(model, optimizer, batch, device, step)
-
-            if src == "l2":
-                state["l2_seen"] += tokens_per_batch
-            else:
-                state["l1_seen"] += tokens_per_batch
-
-            step += 1
-
-            # -------- Checkpoints --------
-            if (
-                state["checkpoint_idx"] < len(checkpoint_tokens)
-                and (state["l2_seen"] * world_size)
-                >= checkpoint_tokens[state["checkpoint_idx"]]
-            ):
-
-                pct = int(CHECKPOINT_FRACS[state["checkpoint_idx"]] * 100)
-                path = os.path.join(run_dir, f"checkpoint_{pct}")
-
-                if is_master:
-                    os.makedirs(path, exist_ok=True)
-
-                    (model.module if is_ddp else model).save_pretrained(path)
-                    
-                    # This saves the local tokenizer into the HF format inside the checkpoint
-                    tokenizer.save_pretrained(path)
-
-                    save_state(run_dir, state)
-                    logging.info(f"Saved checkpoint {pct}% with local tokenizer files.")
-
-                    try:
-                        push_to_hub(path, lang, state["checkpoint_idx"])
-                    except Exception as e:
-                        logging.error(f"Hub upload failed: {e}")
-
-                state["checkpoint_idx"] += 1
-
-                if is_ddp:
-                    dist.barrier()
-
-    if is_ddp:
-        dist.destroy_process_group()
-
-    if is_master:
-        logging.info("Training complete.")
-
-
-# ================= ENTRY =================
-
+# ================= MAIN =================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lang", required=True)
-    args = parser.parse_args()
-
-    train(args.lang)
+    train_language()
