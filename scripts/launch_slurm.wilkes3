@@ -2,9 +2,9 @@
 #SBATCH -J bilingual
 #SBATCH -A BUTTERY-SL2-GPU
 #SBATCH -p ampere
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gpus=4
+#SBATCH --nodes=4               # 4 nodes x 4 GPUs = 16 GPUs total
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
 #SBATCH --exclusive
 #SBATCH --time=36:00:00
 #SBATCH --mail-type=FAIL
@@ -38,8 +38,12 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 LANG=$1
 shift
 
+# DDP across 4 nodes, 4 GPUs per node
 torchrun \
-  --standalone \
+  --nnodes=4 \
   --nproc_per_node=4 \
-  bilingual/train.py \
+  --rdzv_id=$SLURM_JOB_ID \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=$(hostname -s):29500 \
+  bilingual/hpc_train_5B.py.py \
   --lang "$LANG" "$@"
