@@ -37,10 +37,14 @@ for d in [CHECKPOINT_DIR, LOG_DIR]:
     d.mkdir(exist_ok=True)
 
 MODEL_CONFIG = {
-    "n_embd": 1024, "n_layer": 24, "n_head": 16,
-    "n_positions": SEQ_LEN, "vocab_size": VOCAB_SIZE,
-    "bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 2,
-    "loss_type": "cross_entropy",
+    "n_embd": 896,
+    "n_layer": 24,
+    "n_head": 14,
+    "n_positions": SEQ_LEN, 
+    "vocab_size": VOCAB_SIZE,
+    "bos_token_id": 0, 
+    "eos_token_id": 1, 
+    "pad_token_id": 2,
 }
 
 # Matching the repo names from your Parquet Factory script
