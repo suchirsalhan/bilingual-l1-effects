@@ -79,7 +79,7 @@ def get_stream(lang):
 
 def run_pipeline(lang, target_tokens):
     print(f"🚀 Starting {lang} pipeline with {NUM_PROC} cores...")
-    repo_id = f"{HF_USER}/{lang}-5B-parquet"
+    repo_id = f"{HF_USER}/{lang}-5B-dataset"
     from huggingface_hub import create_repo
     create_repo(repo_id, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
 
