@@ -9,7 +9,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
 from datasets import load_dataset
-from transformers import AutoTokenizer, HfApi
+from transformers import AutoTokenizer
+from huggingface_hub import HfApi, create_repo
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
