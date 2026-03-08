@@ -73,7 +73,8 @@ DATASETS = {
 # ==========================================================
 
 def setup_distributed():
-
+    print("hello distributed")
+    quit()
     if "RANK" in os.environ:
         dist.init_process_group(
             backend="nccl",
