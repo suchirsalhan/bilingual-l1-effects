@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
+
 import os
 import math
 import time
 import glob
 import argparse
-from pathlib import Path
 import datetime
 import contextlib
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -19,19 +20,26 @@ from datasets import load_dataset
 from huggingface_hub import upload_folder, create_repo
 
 
-print("hello")
-quit()
-# ==========================================================
+# ------------------------------------------------
+# ENVIRONMENT SAFETY
+# ------------------------------------------------
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("NCCL_DEBUG", "WARN")
+
+
+# ------------------------------------------------
 # ARGUMENTS
-# ==========================================================
+# ------------------------------------------------
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--lang_l1", required=True)
 parser.add_argument("--lang_l2", default="en")
 
-parser.add_argument("--total_tokens", type=int, default=5_000_000_000)
 parser.add_argument("--seq_len", type=int, default=512)
+parser.add_argument("--total_tokens", type=int, default=5_000_000_000)
 
 parser.add_argument("--batch_size", type=int, default=16)
 parser.add_argument("--grad_accum", type=int, default=8)
@@ -39,15 +47,13 @@ parser.add_argument("--grad_accum", type=int, default=8)
 parser.add_argument("--lr", type=float, default=2e-4)
 parser.add_argument("--warmup_frac", type=float, default=0.01)
 
-args, _ = parser.parse_known_args()
+args = parser.parse_args()
 
 L1 = args.lang_l1
 L2 = args.lang_l2
 PAIR = f"{L1}-{L2}"
 
 HF_USER = "RA-ALTA"
-HF_TOKEN = os.environ.get("HF_TOKEN")
-
 REPO_ID = f"{HF_USER}/{PAIR}-bilingual-5B"
 TOKENIZER_ID = f"{HF_USER}/tokenizer-{PAIR}"
 
@@ -69,42 +75,38 @@ DATASETS = {
     "l2": f"{HF_USER}/{L2}-{L1}-5B",
 }
 
-print("hello world")
-quit()
 
-# ==========================================================
+# ------------------------------------------------
 # DISTRIBUTED SETUP
-# ==========================================================
+# ------------------------------------------------
 
 def setup_distributed():
-    print("hello distributed")
-    quit()
-    if "RANK" in os.environ:
+
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    distributed = world > 1
+
+    if distributed:
         dist.init_process_group(
             backend="nccl",
+            init_method="env://",
             timeout=datetime.timedelta(hours=2)
         )
 
-        rank = dist.get_rank()
-        world = dist.get_world_size()
-
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
-
+        device = torch.device("cuda", local_rank)
     else:
-
-        rank = 0
-        world = 1
-        local_rank = 0
-
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+        device = torch.device("cpu")
 
     return rank, world, local_rank, device
 
 
-# ==========================================================
+# ------------------------------------------------
 # LOGGING
-# ==========================================================
+# ------------------------------------------------
 
 def log(rank, msg):
 
@@ -120,14 +122,13 @@ def log(rank, msg):
         f.write(line + "\n")
 
 
-# ==========================================================
-# DATASET
-# ==========================================================
+# ------------------------------------------------
+# STREAMING DATASET
+# ------------------------------------------------
 
 class StreamingDataset(IterableDataset):
 
     def __init__(self, repo, rank, world):
-
         self.repo = repo
         self.rank = rank
         self.world = world
@@ -140,13 +141,10 @@ class StreamingDataset(IterableDataset):
             streaming=True
         )
 
-        ds = ds.shuffle(buffer_size=10_000, seed=42)
+        ds = ds.shuffle(buffer_size=10000, seed=42)
 
-        ds = ds.shard(
-            num_shards=self.world,
-            index=self.rank,
-            contiguous=True
-        )
+        if self.world > 1:
+            ds = ds.shard(self.world, self.rank)
 
         for row in ds:
 
@@ -164,7 +162,8 @@ def infinite_loader(repo, rank, world):
         dataset,
         batch_size=BATCH,
         num_workers=0,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=False
     )
 
     while True:
@@ -172,9 +171,9 @@ def infinite_loader(repo, rank, world):
             yield batch
 
 
-# ==========================================================
+# ------------------------------------------------
 # CHECKPOINT UTILS
-# ==========================================================
+# ------------------------------------------------
 
 def latest_checkpoint():
 
@@ -186,11 +185,7 @@ def latest_checkpoint():
     return max(ckpts, key=lambda x: int(x.split("-")[-1]))
 
 
-def save_checkpoint(rank, world, model, tokenizer, optimizer, step, tokens):
-
-    # Barrier ensures all ranks finish the current step before rank 0 writes
-    if world > 1:
-        dist.barrier()
+def save_checkpoint(rank, model, tokenizer, optimizer, step, tokens):
 
     if rank != 0:
         return
@@ -214,18 +209,31 @@ def save_checkpoint(rank, world, model, tokenizer, optimizer, step, tokens):
 
     log(rank, f"checkpoint saved: step {step}")
 
+    try:
 
-# ==========================================================
+        create_repo(REPO_ID, exist_ok=True)
+
+        upload_folder(
+            repo_id=REPO_ID,
+            folder_path=folder,
+            path_in_repo=f"step-{step}"
+        )
+
+        log(rank, "checkpoint uploaded to HF")
+
+    except Exception as e:
+        log(rank, f"HF upload failed: {e}")
+
+
+# ------------------------------------------------
 # TRAIN
-# ==========================================================
+# ------------------------------------------------
 
 def train():
 
     rank, world, local_rank, device = setup_distributed()
 
-    print("setup done")
-    print(rank)
-    quit()
+    log(rank, f"GPUs detected: {torch.cuda.device_count()}")
 
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
 
@@ -247,13 +255,14 @@ def train():
 
     if cp:
         log(rank, f"resuming {cp}")
-        model = GPT2LMHeadModel.from_pretrained(cp).to(device)
+        model = GPT2LMHeadModel.from_pretrained(cp)
+        state = torch.load(Path(cp) / "optimizer.pt", map_location="cpu")
+        step = state["step"]
+        tokens_seen = state["tokens"]
     else:
-        model = GPT2LMHeadModel(config).to(device)
+        model = GPT2LMHeadModel(config)
 
-    # FIX 1: Wrap in DDP BEFORE creating optimizer so parameter references are stable
-    if world > 1:
-        model = DDP(model, device_ids=[local_rank])
+    model.to(device)
 
     optimizer = optim.AdamW(
         model.parameters(),
@@ -262,12 +271,11 @@ def train():
         weight_decay=0.1
     )
 
-    # FIX 2: Load optimizer state AFTER DDP wrap so param groups match
     if cp:
-        state = torch.load(Path(cp) / "optimizer.pt", map_location=device)
         optimizer.load_state_dict(state["optimizer"])
-        step = state["step"]
-        tokens_seen = state["tokens"]
+
+    if world > 1:
+        model = DDP(model, device_ids=[local_rank])
 
     l1_loader = infinite_loader(DATASETS["l1"], rank, world)
     l2_loader = infinite_loader(DATASETS["l2"], rank, world)
@@ -277,7 +285,7 @@ def train():
 
     model.train()
 
-    log(rank, f"tokens/step = {tokens_per_step}")
+    log(rank, f"tokens per step: {tokens_per_step}")
 
     while tokens_seen < TOTAL_TOKENS:
 
@@ -323,25 +331,17 @@ def train():
             log(rank, f"step {step} | {tokens_seen/1e9:.2f}B tokens | lr {lr:.2e}")
 
         if step % 500 == 0:
-            # FIX 3: Pass world to save_checkpoint so barrier is called inside
-            save_checkpoint(rank, world, model, tokenizer, optimizer, step, tokens_seen)
+            save_checkpoint(rank, model, tokenizer, optimizer, step, tokens_seen)
 
-    save_checkpoint(rank, world, model, tokenizer, optimizer, step, tokens_seen)
+    save_checkpoint(rank, model, tokenizer, optimizer, step, tokens_seen)
 
     log(rank, "training complete")
 
-    # FIX 4: Always clean up process group
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
-# ==========================================================
+# ------------------------------------------------
 
 if __name__ == "__main__":
-    # FIX 5: Wrap in try/finally so process group is cleaned up even on crash
-    try:
-        train()
-    except Exception:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        raise
+    train()
