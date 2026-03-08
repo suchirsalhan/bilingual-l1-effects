@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import optim
 from torch.utils.data import DataLoader, IterableDataset
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import GPT2Config, GPT2LMHeadModel, AutoTokenizer # Added AutoTokenizer
 from datasets import load_dataset
 from huggingface_hub import upload_folder
 
@@ -22,6 +22,7 @@ from huggingface_hub import upload_folder
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 REPO_ID = f"{HF_USER}/es-en-bilingual-5B"
+TOKENIZER_ID = f"{HF_USER}/es-en-tokenizer" # Update this to your actual tokenizer repo
 
 SEQ_LEN = 512
 TOTAL_TOKENS = 5_000_000_000
@@ -47,25 +48,23 @@ MODEL_CONFIG = {
     "pad_token_id": 2,
 }
 
-# Matching the repo names from your Parquet Factory script
 DATASETS = {
     "es": f"{HF_USER}/es-en-5B", 
     "en": f"{HF_USER}/en-es-5B"
 }
 
-PHASE_2_START = TOTAL_TOKENS // 2 # 2.5B Tokens
+PHASE_2_START = TOTAL_TOKENS // 2 
 BASE_CHECKPOINTS = [0.25, 0.5, 0.75, 1.0]
 LOG_CHECKPOINTS = [2 ** i / 100 for i in range(0, 7)]
 CHECKPOINT_PERCENTAGES = sorted(set(BASE_CHECKPOINTS + LOG_CHECKPOINTS))
 saved_checkpoints = set()
 
 # ==========================================================
-# DATASET & LOADER (Optimized for Parquet)
+# DATASET & LOADER
 # ==========================================================
 class BilingualParquetDataset(IterableDataset):
     def __init__(self, repo, skip_steps=0):
         self.repo = repo
-        # skip calculation: steps * batch * accumulation
         self.skip = skip_steps * BATCH_SIZE * GRAD_ACCUM_STEPS
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.rank = dist.get_rank() if dist.is_initialized() else 0
@@ -75,25 +74,18 @@ class BilingualParquetDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info else 1
         worker_id = worker_info.id if worker_info else 0
         
-        # Load the dataset in streaming mode (reads Parquet shards)
         ds = load_dataset(self.repo, split="train", streaming=True)
-        
-        # Shuffle shards to ensure different nodes see different data
         ds = ds.shuffle(seed=42, buffer_size=10_000)
         
-        # Shard the dataset across GPUs and Workers
         num_shards = self.world_size * num_workers
         shard_idx = (self.rank * num_workers) + worker_id
         ds = ds.shard(num_shards=num_shards, index=shard_idx)
         
-        # Skip logic for resuming
         if self.skip > 0:
-            # We skip proportional to the amount of workers/shards
             ds = ds.skip(self.skip // num_shards)
             
         for item in ds:
             ids = torch.tensor(item["input_ids"], dtype=torch.long)
-            # The factory script produces (SEQ_LEN,) blocks
             if ids.size(0) == SEQ_LEN:
                 yield ids
 
@@ -114,7 +106,6 @@ def setup():
         dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=7200))
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     else:
-        # Local non-distributed fallback
         print("⚠️ Not in distributed mode. Running locally.")
         dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.FileStore("tmp_store", 1))
 
@@ -142,7 +133,10 @@ def train():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     world_size = dist.get_world_size()
 
-    # Resume Logic: Sync checkpoints set
+    # --- TOKENIZER INITIALIZATION ---
+    # We load it here so it is in scope for the checkpointing block
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True)
+
     for cp in glob.glob(str(CHECKPOINT_DIR / "es-en-bilingual-*")):
         try:
             pct_val = int(cp.split("-")[-1]) / 100.0
@@ -165,7 +159,6 @@ def train():
 
     model = DDP(model, device_ids=[local_rank]) if torch.cuda.is_available() else model
 
-    # Data Loaders
     es_loader = get_infinite_loader(DATASETS["es"], start_step)
     en_loader = get_infinite_loader(DATASETS["en"], start_step)
 
@@ -179,15 +172,12 @@ def train():
     while tokens_seen < TOTAL_TOKENS:
         optimizer.zero_grad(set_to_none=True)
         
-        # Phase 1: 100% Spanish (with rare English injection)
-        # Phase 2: 33% Spanish / 66% English mix
         if tokens_seen < PHASE_2_START:
             loader = es_loader if step % 10 != 0 else en_loader
         else:
             loader = es_loader if step % 3 == 0 else en_loader
 
         for micro_step in range(GRAD_ACCUM_STEPS):
-            # Optimizing syncs for grad accumulation
             my_context = model.no_sync() if (isinstance(model, DDP) and micro_step < GRAD_ACCUM_STEPS - 1) else contextlib.nullcontext()
             
             with my_context:
@@ -197,14 +187,12 @@ def train():
                     loss = outputs.loss / GRAD_ACCUM_STEPS
                 loss.backward()
 
-        # Gradient clipping for stability
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
         tokens_seen += tokens_per_step
         step += 1
 
-        # Cosine LR Schedule
         if tokens_seen < warmup_tokens:
             lr = LR_MAX * (tokens_seen / warmup_tokens)
         else:
@@ -214,13 +202,12 @@ def train():
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        # Reporting
         if rank == 0 and step % 20 == 0:
             elapsed = time.time() - start_time
             tok_sec = (tokens_seen - (start_step * tokens_per_step)) / max(elapsed, 1)
-            log(f"Step {step} | {tokens_seen/1e9:.3f}B Tok | {tok_sec:,.0f} tok/s | LR {lr:.2e} | Phase {'2' if tokens_seen >= PHASE_2_START else '1'}")
+            log(f"Step {step} | {tokens_seen/1e9:.3f}B Tok | {tok_sec:,.0f} tok/s | LR {lr:.2e}")
 
-        # Checkpointing
+        # --- UPDATED CHECKPOINTING SECTION ---
         fraction = tokens_seen / TOTAL_TOKENS
         for cp_frac in CHECKPOINT_PERCENTAGES:
             if fraction >= cp_frac and cp_frac not in saved_checkpoints:
@@ -231,16 +218,19 @@ def train():
                     cp_path = CHECKPOINT_DIR / f"es-en-bilingual-{pct}"
                     cp_path.mkdir(parents=True, exist_ok=True)
 
-                    # Save model and optimizer
                     model_to_save = model.module if hasattr(model, "module") else model
                     model_to_save.save_pretrained(cp_path, safe_serialization=False)
+                    
+                    # ✅ Save tokenizer too for HF pipeline/Trainer compatibility
+                    tokenizer.save_pretrained(cp_path)
+
                     torch.save({
                         "step": step,
                         "tokens_seen": tokens_seen,
                         "optimizer_state_dict": optimizer.state_dict()
                     }, cp_path / "optimizer.pt")
 
-                    log(f"💾 Checkpoint saved: {pct}%")
+                    log(f"💾 Checkpoint saved: {pct}% (inc. tokenizer)")
                     
                     if HF_TOKEN:
                         try:
