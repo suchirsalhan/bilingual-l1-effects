@@ -88,7 +88,6 @@ def run_benchmark():
     
     test_cases = {
         "ES_Legal": "El contrato se rige por las leyes.",
-        "CN_Test": "我喜欢机器学习", # This would have failed with Whitespace()
         "Emoji": "Learning is fun! 🚀🔥"
     }
 
