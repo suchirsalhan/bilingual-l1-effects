@@ -34,9 +34,9 @@ PAIR = f"{L1}-{L2}"
 # ==========================================================
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+# Base Repositories
 REPO_ID = f"{HF_USER}/{PAIR}-bilingual-5B"
-CURRICULUM_REPO_ID = f"{HF_USER}/{PAIR}-l1-{L1}-l2-{L2}-curriculum"
-# Your requested new repo for Phase 1 completion
 PHASE1_FINAL_REPO = f"{HF_USER}/{L1}-namefinal-phase-1" 
 TOKENIZER_ID = f"{HF_USER}/tokenizer-{PAIR}"
 
@@ -70,15 +70,16 @@ DATASETS = {
 }
 
 PHASE_2_START = TOTAL_TOKENS // 2 
-P1_TARGETS = [0.0, 0.125, 0.25] # Intermediate Phase 1 targets
+P1_TARGETS = [0.0, 0.125, 0.25] 
+
+# CURRICULUM: Each key will now trigger a UNIQUE REPO creation
 P2_CURRICULUM = {
-    0.625: f"l1-{L1}-l2-{L2}-beginner",    
-    0.75:  f"l1-{L1}-l2-{L2}-intermediate",
-    0.875: f"l1-{L1}-l2-{L2}-advanced",    
-    1.0:   f"l1-{L1}-l2-{L2}-fluent"         
+    0.625: f"{PAIR}-l1-{L1}-l2-{L2}-beginner",    
+    0.75:  f"{PAIR}-l1-{L1}-l2-{L2}-intermediate",
+    0.875: f"{PAIR}-l1-{L1}-l2-{L2}-advanced",    
+    1.0:   f"{PAIR}-l1-{L1}-l2-{L2}-fluent"         
 }
 
-# Combine all milestones; 0.5 is explicitly the "Final Phase 1" mark
 ALL_CHECKPOINTS = sorted(set(P1_TARGETS + [0.5] + list(P2_CURRICULUM.keys())))
 saved_checkpoints = set()
 
@@ -135,11 +136,12 @@ def setup():
     else:
         dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.FileStore(f"tmp_store_{PAIR}", 1))
 
-    # Create missing repos on HF if rank 0
+    # Create primary repos on HF if rank 0
     if dist.get_rank() == 0 and HF_TOKEN:
-        for r_id in [REPO_ID, CURRICULUM_REPO_ID, PHASE1_FINAL_REPO]:
+        for r_id in [REPO_ID, PHASE1_FINAL_REPO]:
             try:
                 create_repo(r_id, token=HF_TOKEN, exist_ok=True)
+                print(f"✅ Verified Repo: {r_id}")
             except Exception as e:
                 print(f"Repo check failed for {r_id}: {e}")
 
@@ -195,7 +197,7 @@ def train():
     while tokens_seen < TOTAL_TOKENS:
         optimizer.zero_grad(set_to_none=True)
         
-        # Phase 1: Heavy L1 (90/10) | Phase 2: Mixed (33/66)
+        # Phase logic
         if tokens_seen < PHASE_2_START:
             loader = l1_loader if step % 10 != 0 else l2_loader
         else:
@@ -219,7 +221,7 @@ def train():
         tokens_seen += tokens_per_step
         step += 1
 
-        # LR Schedule (Cosine Decay)
+        # LR Schedule
         if tokens_seen < warmup_tokens:
             lr = LR_MAX * (tokens_seen / warmup_tokens)
         else:
@@ -242,7 +244,7 @@ def train():
                     cp_path = CHECKPOINT_DIR / folder_name
                     cp_path.mkdir(parents=True, exist_ok=True)
 
-                    # Save Model & Tokenizer
+                    # Save Locally
                     model_to_save = model.module if hasattr(model, "module") else model
                     model_to_save.save_pretrained(cp_path, safe_serialization=False)
                     tokenizer.save_pretrained(cp_path)
@@ -255,24 +257,26 @@ def train():
                     
                     if HF_TOKEN:
                         try:
-                            # 1. Main Bilingual Repo
+                            # 1. Main Bilingual Rolling Repo
                             upload_folder(folder_path=str(cp_path), repo_id=REPO_ID, token=HF_TOKEN)
                             
-                            # 2. Special Case: End of Phase 1 (50% mark)
+                            # 2. End of Phase 1 (50% mark) - Dedicated Repo
                             if cp_frac == 0.5:
                                 log(f"🌟 UPLOADING PHASE 1 FINAL TO: {PHASE1_FINAL_REPO}")
                                 upload_folder(folder_path=str(cp_path), repo_id=PHASE1_FINAL_REPO, token=HF_TOKEN)
 
-                            # 3. Curriculum Repo
+                            # 3. Dedicated Curriculum Repos (No subfolders)
                             if cp_frac in P2_CURRICULUM:
-                                label = P2_CURRICULUM[cp_frac]
+                                repo_name = P2_CURRICULUM[cp_frac]
+                                TARGET_REPO = f"{HF_USER}/{repo_name}"
+                                
+                                log(f"🚀 Creating and pushing to dedicated repo: {TARGET_REPO}")
+                                create_repo(TARGET_REPO, token=HF_TOKEN, exist_ok=True)
                                 upload_folder(
                                     folder_path=str(cp_path), 
-                                    repo_id=CURRICULUM_REPO_ID, 
-                                    path_in_repo=label, 
+                                    repo_id=TARGET_REPO, 
                                     token=HF_TOKEN
                                 )
-                                log(f"🚀 Pushed curriculum: {label}")
                         except Exception as e:
                             log(f"⚠️ Upload failed: {e}")
                 dist.barrier()
