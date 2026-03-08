@@ -14,7 +14,7 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 LANG = "es"
 VOCAB_SIZE = 50_000
 BOOTSTRAP_SENTENCES = 2_000_000  # High enough for subword quality
-REPO_ID = f"{HF_USER}/tokenizer-{LANG}-en-parity-v2"
+REPO_ID = f"{HF_USER}/tokenizer-{LANG}-en"
 OUT_DIR = Path("tokenizer-local-temp")
 OUT_DIR.mkdir(exist_ok=True)
 
