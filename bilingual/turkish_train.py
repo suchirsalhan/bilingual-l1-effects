@@ -5,6 +5,7 @@ import math
 import glob
 import datetime
 import contextlib
+import shutil
 from pathlib import Path
 
 import torch
@@ -37,24 +38,21 @@ for d in [CHECKPOINT_DIR, LOG_DIR]:
     d.mkdir(exist_ok=True)
 
 MODEL_CONFIG = {
-    "n_embd": 896,       # Reduced from 1024
-    "n_layer": 24,      # Kept at 24 for depth
-    "n_head": 14,       # 896 / 14 = 64 (standard head dimension)
+    "n_embd": 896,
+    "n_layer": 24,
+    "n_head": 14,
     "n_positions": SEQ_LEN, 
     "vocab_size": VOCAB_SIZE,
     "bos_token_id": 0, 
     "eos_token_id": 1, 
     "pad_token_id": 2,
-    "loss_type": "cross_entropy",
 }
 
 DATASETS = {"tr": "RA-ALTA/tr-5B", "en": "RA-ALTA/en-5B"}
 
-# Phase 2 logic
+# Checkpointing Milestones
 PHASE_2_START = TOTAL_TOKENS // 2
-BASE_CHECKPOINTS = [0.25, 0.5, 0.75, 1.0]
-LOG_CHECKPOINTS = [2 ** i / 100 for i in range(0, 7)]
-CHECKPOINT_PERCENTAGES = sorted(set(BASE_CHECKPOINTS + LOG_CHECKPOINTS))
+TARGET_PERCENTAGES = [0.25, 0.50, 0.75, 1.0]
 saved_checkpoints = set()
 
 # ==========================================================
@@ -114,12 +112,19 @@ def log(msg):
             f.write(line + "\n")
 
 def get_latest_checkpoint():
-    # Fixed to look for your tr-english-X folders
-    ckpts = glob.glob(str(CHECKPOINT_DIR / "tr-english-*"))
+    """Finds the most recent checkpoint based on Phase and Percentage."""
+    ckpts = glob.glob(str(CHECKPOINT_DIR / "l*_*"))
     if not ckpts:
         return None
-    # Sort numerically so that '64' > '8'
-    return Path(max(ckpts, key=lambda x: int(x.split("-")[-1])))
+    
+    def sort_key(path_str):
+        name = Path(path_str).name # e.g., l1_25
+        phase = int(name.split('_')[0][1:]) # Extract 1 from l1
+        pct = int(name.split('_')[1])       # Extract 25
+        return (phase, pct)
+
+    latest = max(ckpts, key=sort_key)
+    return Path(latest)
 
 # ==========================================================
 # TRAINING LOOP
@@ -131,13 +136,13 @@ def train():
     device = torch.device(f"cuda:{local_rank}")
     world_size = dist.get_world_size()
 
-    # Pre-populate saved_checkpoints so we don't re-upload what we already have
-    for cp in glob.glob(str(CHECKPOINT_DIR / "tr-english-*")):
-        try:
-            pct_val = int(cp.split("-")[-1]) / 100.0
-            saved_checkpoints.add(pct_val)
-        except ValueError:
-            continue
+    # Pre-populate saved_checkpoints
+    for cp in glob.glob(str(CHECKPOINT_DIR / "l*_*")):
+        cp_path = Path(cp)
+        # Store as "p1_0.25" etc to match loop logic
+        phase_num = cp_path.name.split('_')[0][1:]
+        pct_val = int(cp_path.name.split('_')[1]) / 100.0
+        saved_checkpoints.add(f"p{phase_num}_{pct_val}")
 
     conf = GPT2Config(**MODEL_CONFIG)
     model = GPT2LMHeadModel(conf).to(device)
@@ -167,14 +172,13 @@ def train():
 
     while tokens_seen < TOTAL_TOKENS:
         optimizer.zero_grad(set_to_none=True)
+        # Phase 1: Mostly TR | Phase 2: Mixed
         loader = tr_loader if tokens_seen < PHASE_2_START or step % 3 == 0 else en_loader
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             my_context = model.no_sync() if micro_step < GRAD_ACCUM_STEPS - 1 else contextlib.nullcontext()
-            
             with my_context:
                 batch = next(loader).to(device, non_blocking=True)
-                # Updated to new non-deprecated API
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     loss = model(batch, labels=batch).loss / GRAD_ACCUM_STEPS
                 loss.backward()
@@ -196,36 +200,47 @@ def train():
             tok_sec = (tokens_seen - (start_step * tokens_per_step)) / max(elapsed, 1)
             log(f"Step {step} | {tokens_seen/1e9:.2f}B Tok | {tok_sec:,.0f} tok/s | LR {lr:.2e}")
 
-        # SYNCHRONIZED CHECKPOINTING
-        if tokens_seen >= PHASE_2_START:
-            fraction = tokens_seen / TOTAL_TOKENS
-            for cp_frac in CHECKPOINT_PERCENTAGES:
-                if fraction >= cp_frac and cp_frac not in saved_checkpoints:
-                    dist.barrier()
-                    
-                    if rank == 0:
-                        saved_checkpoints.add(cp_frac)
-                        pct = int(cp_frac * 100)
-                        cp_path = CHECKPOINT_DIR / f"tr-english-{pct}"
-                        cp_path.mkdir(parents=True, exist_ok=True)
+        # ==========================================================
+        # MULTI-PHASE CHECKPOINTING (L1 & L2)
+        # ==========================================================
+        current_phase = 1 if tokens_seen < PHASE_2_START else 2
+        fraction = tokens_seen / TOTAL_TOKENS
+        
+        should_save = False
+        save_name = ""
 
-                        model.module.save_pretrained(cp_path, safe_serialization=False)
-                        torch.save({
-                            "step": step,
-                            "tokens_seen": tokens_seen,
-                            "optimizer_state_dict": optimizer.state_dict()
-                        }, cp_path / "optimizer.pt")
+        for cp_frac in TARGET_PERCENTAGES:
+            checkpoint_key = f"p{current_phase}_{cp_frac}"
+            if fraction >= cp_frac and checkpoint_key not in saved_checkpoints:
+                should_save = True
+                pct = int(cp_frac * 100)
+                save_name = f"l{current_phase}_{pct}"
+                if rank == 0:
+                    saved_checkpoints.add(checkpoint_key)
+                break
 
-                        log(f"💾 Phase 2 checkpoint saved locally: {pct}%")
-                        
-                        if HF_TOKEN:
-                            try:
-                                upload_folder(folder_path=str(cp_path), repo_id=REPO_ID, token=HF_TOKEN)
-                                log(f"🚀 Uploaded to HF: {REPO_ID}")
-                            except Exception as e:
-                                log(f"⚠️ Upload failed: {e}")
-                    
-                    dist.barrier()
+        if should_save:
+            dist.barrier()
+            if rank == 0:
+                cp_path = CHECKPOINT_DIR / save_name
+                cp_path.mkdir(parents=True, exist_ok=True)
+
+                model.module.save_pretrained(cp_path, safe_serialization=False)
+                torch.save({
+                    "step": step,
+                    "tokens_seen": tokens_seen,
+                    "optimizer_state_dict": optimizer.state_dict()
+                }, cp_path / "optimizer.pt")
+
+                log(f"💾 Checkpoint saved locally: {save_name}")
+                
+                if HF_TOKEN:
+                    try:
+                        upload_folder(folder_path=str(cp_path), repo_id=REPO_ID, token=HF_TOKEN)
+                        log(f"🚀 Uploaded to HF: {REPO_ID}/{save_name}")
+                    except Exception as e:
+                        log(f"⚠️ Upload failed: {e}")
+            dist.barrier()
 
     dist.destroy_process_group()
 
