@@ -22,8 +22,7 @@ from huggingface_hub import upload_folder
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 REPO_ID = f"{HF_USER}/es-en-bilingual-5B"
-TOKENIZER_ID = f"{HF_USER}/es-en-tokenizer" # Update this to your actual tokenizer repo
-
+TOKENIZER_ID = f"{HF_USER}/tokenizer-es-en"
 SEQ_LEN = 512
 TOTAL_TOKENS = 5_000_000_000
 GRAD_ACCUM_STEPS = 8
