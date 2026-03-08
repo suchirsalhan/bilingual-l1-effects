@@ -67,6 +67,8 @@ DATASETS = {
     "l2": f"{HF_USER}/{L2}-{L1}-5B",
 }
 
+print("hello world")
+quit()
 
 # ==========================================================
 # DISTRIBUTED SETUP
