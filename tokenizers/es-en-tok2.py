@@ -38,27 +38,29 @@ def train_and_push():
     print(f"🚀 Training Byte-Level BPE (50k Vocab)...")
     
     # Initialize BPE with byte_fallback for ultimate robustness
-    tokenizer = Tokenizer(models.BPE(byte_fallback=True))
+    tokenizer = Tokenizer(models.BPE(byte_fallback=False))
     
     # 1. Normalization: Keep it simple for Byte-Level
     tokenizer.normalizer = normalizers.Sequence([normalizers.NFC()])
     
     # 2. Pre-tokenization: Use ByteLevel instead of Whitespace
     # This splits by bytes and handles whitespace as a special character (Ġ)
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
     
     # 3. Post-Processing: Critical for GPT-2 style leading space preservation
-    tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
+    tokenizer.post_processor = processors.TemplateProcessing(
+    single="<s> $A </s>",
+    pair="<s> $A </s> <s> $B </s>",
+    special_tokens=[("<s>", 0), ("</s>", 1)]
+    )
     
     # 4. Decoder: Converts the byte-shards back into readable text
-    tokenizer.decoder = decoders.ByteLevel()
+    tokenizer.decoder = decoders.BPEDecoder()
 
     trainer = trainers.BpeTrainer(
-        vocab_size=VOCAB_SIZE,
-        min_frequency=2, 
-        special_tokens=["<s>", "</s>", "<pad>", "<unk>"],
-        # We must initialize the alphabet with all 256 possible bytes
-        initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
+    vocab_size=VOCAB_SIZE,
+    min_frequency=2,
+    special_tokens=["<s>", "</s>", "<pad>", "<unk>"]
     )
 
     tokenizer.train_from_iterator(get_training_corpus(), trainer=trainer)
