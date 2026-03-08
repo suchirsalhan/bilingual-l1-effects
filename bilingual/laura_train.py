@@ -213,7 +213,9 @@ def save_checkpoint(rank, model, tokenizer, optimizer, step, tokens):
 def train():
 
     rank, world, local_rank, device = setup_distributed()
-
+    print("set up done!woohoo!!!")
+    print(rank)
+    print(device)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
 
     config = GPT2Config(
