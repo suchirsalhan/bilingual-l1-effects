@@ -15,13 +15,12 @@ from torch import optim
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import GPT2Config, GPT2LMHeadModel, AutoTokenizer
 from datasets import load_dataset
-from huggingface_hub import upload_folder
+from huggingface_hub import upload_folder, create_repo
 
 # ==========================================================
 # ARGUMENT PARSING
 # ==========================================================
 parser = argparse.ArgumentParser()
-parser.param_groups = [] # Dummy for internal compatibility if needed
 parser.add_argument("--lang_l1", type=str, required=True, help="L1 Language code (e.g., tr, zh, es)")
 parser.add_argument("--lang_l2", type=str, default="en", help="L2 Language code (default: en)")
 args = parser.parse_args()
@@ -37,6 +36,8 @@ HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 REPO_ID = f"{HF_USER}/{PAIR}-bilingual-5B"
 CURRICULUM_REPO_ID = f"{HF_USER}/{PAIR}-l1-{L1}-l2-{L2}-curriculum"
+# Your requested new repo for Phase 1 completion
+PHASE1_FINAL_REPO = f"{HF_USER}/{L1}-namefinal-phase-1" 
 TOKENIZER_ID = f"{HF_USER}/tokenizer-{PAIR}"
 
 SEQ_LEN = 512
@@ -63,14 +64,13 @@ MODEL_CONFIG = {
     "pad_token_id": 2,
 }
 
-# Assumes dataset naming convention: user/lang1-lang2-5B
 DATASETS = {
     "l1": f"{HF_USER}/{L1}-{L2}-5B", 
     "l2": f"{HF_USER}/{L2}-{L1}-5B"
 }
 
 PHASE_2_START = TOTAL_TOKENS // 2 
-P1_TARGETS = [0.0, 0.125, 0.25, 0.5] 
+P1_TARGETS = [0.0, 0.125, 0.25] # Intermediate Phase 1 targets
 P2_CURRICULUM = {
     0.625: f"l1-{L1}-l2-{L2}-beginner",    
     0.75:  f"l1-{L1}-l2-{L2}-intermediate",
@@ -78,7 +78,8 @@ P2_CURRICULUM = {
     1.0:   f"l1-{L1}-l2-{L2}-fluent"         
 }
 
-ALL_CHECKPOINTS = sorted(set(P1_TARGETS + list(P2_CURRICULUM.keys())))
+# Combine all milestones; 0.5 is explicitly the "Final Phase 1" mark
+ALL_CHECKPOINTS = sorted(set(P1_TARGETS + [0.5] + list(P2_CURRICULUM.keys())))
 saved_checkpoints = set()
 
 # ==========================================================
@@ -96,20 +97,23 @@ class BilingualParquetDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info else 1
         worker_id = worker_info.id if worker_info else 0
         
-        ds = load_dataset(self.repo, split="train", streaming=True)
-        ds = ds.shuffle(seed=42, buffer_size=10_000)
-        
-        num_shards = self.world_size * num_workers
-        shard_idx = (self.rank * num_workers) + worker_id
-        ds = ds.shard(num_shards=num_shards, index=shard_idx)
-        
-        if self.skip > 0:
-            ds = ds.skip(self.skip // num_shards)
+        try:
+            ds = load_dataset(self.repo, split="train", streaming=True)
+            ds = ds.shuffle(seed=42, buffer_size=10_000)
             
-        for item in ds:
-            ids = torch.tensor(item["input_ids"], dtype=torch.long)
-            if ids.size(0) == SEQ_LEN:
-                yield ids
+            num_shards = self.world_size * num_workers
+            shard_idx = (self.rank * num_workers) + worker_id
+            ds = ds.shard(num_shards=num_shards, index=shard_idx)
+            
+            if self.skip > 0:
+                ds = ds.skip(self.skip // num_shards)
+                
+            for item in ds:
+                ids = torch.tensor(item["input_ids"], dtype=torch.long)
+                if ids.size(0) == SEQ_LEN:
+                    yield ids
+        except Exception as e:
+            print(f"Error loading dataset {self.repo}: {e}")
 
 def get_infinite_loader(repo, skip_steps):
     def data_generator():
@@ -130,6 +134,14 @@ def setup():
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     else:
         dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.FileStore(f"tmp_store_{PAIR}", 1))
+
+    # Create missing repos on HF if rank 0
+    if dist.get_rank() == 0 and HF_TOKEN:
+        for r_id in [REPO_ID, CURRICULUM_REPO_ID, PHASE1_FINAL_REPO]:
+            try:
+                create_repo(r_id, token=HF_TOKEN, exist_ok=True)
+            except Exception as e:
+                print(f"Repo check failed for {r_id}: {e}")
 
 def log(msg):
     if dist.get_rank() == 0:
@@ -183,22 +195,23 @@ def train():
     while tokens_seen < TOTAL_TOKENS:
         optimizer.zero_grad(set_to_none=True)
         
-        # Sampling logic (Curriculum)
+        # Phase 1: Heavy L1 (90/10) | Phase 2: Mixed (33/66)
         if tokens_seen < PHASE_2_START:
-            # Phase 1: Heavy L1 (90/10)
             loader = l1_loader if step % 10 != 0 else l2_loader
         else:
-            # Phase 2: Mixed (33/66)
             loader = l1_loader if step % 3 == 0 else l2_loader
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             my_context = model.no_sync() if (isinstance(model, DDP) and micro_step < GRAD_ACCUM_STEPS - 1) else contextlib.nullcontext()
             with my_context:
-                batch = next(loader).to(device, non_blocking=True)
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    outputs = model(batch, labels=batch)
-                    loss = outputs.loss / GRAD_ACCUM_STEPS
-                loss.backward()
+                try:
+                    batch = next(loader).to(device, non_blocking=True)
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        outputs = model(batch, labels=batch)
+                        loss = outputs.loss / GRAD_ACCUM_STEPS
+                    loss.backward()
+                except StopIteration:
+                    break
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -206,7 +219,7 @@ def train():
         tokens_seen += tokens_per_step
         step += 1
 
-        # LR Schedule
+        # LR Schedule (Cosine Decay)
         if tokens_seen < warmup_tokens:
             lr = LR_MAX * (tokens_seen / warmup_tokens)
         else:
@@ -217,7 +230,7 @@ def train():
         if rank == 0 and step % 20 == 0:
             log(f"Step {step} | {tokens_seen/1e9:.3f}B Tok | LR {lr:.2e}")
 
-        # --- CHECKPOINTING ---
+        # --- CHECKPOINTING & UPLOADING ---
         fraction = tokens_seen / TOTAL_TOKENS
         for cp_frac in ALL_CHECKPOINTS:
             if fraction >= cp_frac and cp_frac not in saved_checkpoints:
@@ -225,34 +238,41 @@ def train():
                 if rank == 0:
                     saved_checkpoints.add(cp_frac)
                     pct = int(cp_frac * 100)
-                    
                     folder_name = f"{PAIR}-bilingual-{pct}"
                     cp_path = CHECKPOINT_DIR / folder_name
                     cp_path.mkdir(parents=True, exist_ok=True)
 
+                    # Save Model & Tokenizer
                     model_to_save = model.module if hasattr(model, "module") else model
                     model_to_save.save_pretrained(cp_path, safe_serialization=False)
                     tokenizer.save_pretrained(cp_path)
-
                     torch.save({
                         "step": step, "tokens_seen": tokens_seen,
                         "optimizer_state_dict": optimizer.state_dict()
                     }, cp_path / "optimizer.pt")
 
-                    log(f"💾 Checkpoint: {pct}%")
+                    log(f"💾 Checkpoint: {pct}% saved locally.")
                     
                     if HF_TOKEN:
                         try:
+                            # 1. Main Bilingual Repo
                             upload_folder(folder_path=str(cp_path), repo_id=REPO_ID, token=HF_TOKEN)
+                            
+                            # 2. Special Case: End of Phase 1 (50% mark)
+                            if cp_frac == 0.5:
+                                log(f"🌟 UPLOADING PHASE 1 FINAL TO: {PHASE1_FINAL_REPO}")
+                                upload_folder(folder_path=str(cp_path), repo_id=PHASE1_FINAL_REPO, token=HF_TOKEN)
+
+                            # 3. Curriculum Repo
                             if cp_frac in P2_CURRICULUM:
                                 label = P2_CURRICULUM[cp_frac]
-                                log(f"🚀 Pushing curriculum milestone: {label}")
                                 upload_folder(
-                                    folder_path=str(cp_path),
-                                    repo_id=CURRICULUM_REPO_ID,
-                                    path_in_repo=label,
+                                    folder_path=str(cp_path), 
+                                    repo_id=CURRICULUM_REPO_ID, 
+                                    path_in_repo=label, 
                                     token=HF_TOKEN
                                 )
+                                log(f"🚀 Pushed curriculum: {label}")
                         except Exception as e:
                             log(f"⚠️ Upload failed: {e}")
                 dist.barrier()
