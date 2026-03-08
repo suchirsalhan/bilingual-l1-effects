@@ -218,6 +218,10 @@ def train():
 
     rank, world, local_rank, device = setup_distributed()
 
+    print("setup done")
+    print(rank)
+    quit()
+
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
 
     config = GPT2Config(
