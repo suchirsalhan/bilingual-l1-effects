@@ -37,10 +37,15 @@ for d in [CHECKPOINT_DIR, LOG_DIR]:
     d.mkdir(exist_ok=True)
 
 MODEL_CONFIG = {
-    "n_embd": 1024, "n_layer": 24, "n_head": 16,
-    "n_positions": SEQ_LEN, "vocab_size": VOCAB_SIZE,
-    "bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 2,
-    "loss_type": "cross_entropy",  # Silences the loss_type warning
+    "n_embd": 896,       # Reduced from 1024
+    "n_layer": 24,      # Kept at 24 for depth
+    "n_head": 14,       # 896 / 14 = 64 (standard head dimension)
+    "n_positions": SEQ_LEN, 
+    "vocab_size": VOCAB_SIZE,
+    "bos_token_id": 0, 
+    "eos_token_id": 1, 
+    "pad_token_id": 2,
+    "loss_type": "cross_entropy",
 }
 
 DATASETS = {"tr": "RA-ALTA/tr-5B", "en": "RA-ALTA/en-5B"}
