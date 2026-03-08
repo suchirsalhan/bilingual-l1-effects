@@ -181,7 +181,11 @@ def latest_checkpoint():
     return max(ckpts, key=lambda x: int(x.split("-")[-1]))
 
 
-def save_checkpoint(rank, model, tokenizer, optimizer, step, tokens):
+def save_checkpoint(rank, world, model, tokenizer, optimizer, step, tokens):
+
+    # Barrier ensures all ranks finish the current step before rank 0 writes
+    if world > 1:
+        dist.barrier()
 
     if rank != 0:
         return
@@ -213,9 +217,7 @@ def save_checkpoint(rank, model, tokenizer, optimizer, step, tokens):
 def train():
 
     rank, world, local_rank, device = setup_distributed()
-    print("set up done!woohoo!!!")
-    print(rank)
-    print(device)
+
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
 
     config = GPT2Config(
@@ -229,7 +231,20 @@ def train():
         pad_token_id=2
     )
 
-    model = GPT2LMHeadModel(config).to(device)
+    step = 0
+    tokens_seen = 0
+
+    cp = latest_checkpoint()
+
+    if cp:
+        log(rank, f"resuming {cp}")
+        model = GPT2LMHeadModel.from_pretrained(cp).to(device)
+    else:
+        model = GPT2LMHeadModel(config).to(device)
+
+    # FIX 1: Wrap in DDP BEFORE creating optimizer so parameter references are stable
+    if world > 1:
+        model = DDP(model, device_ids=[local_rank])
 
     optimizer = optim.AdamW(
         model.parameters(),
@@ -238,26 +253,12 @@ def train():
         weight_decay=0.1
     )
 
-    step = 0
-    tokens_seen = 0
-
-    cp = latest_checkpoint()
-
+    # FIX 2: Load optimizer state AFTER DDP wrap so param groups match
     if cp:
-
-        log(rank, f"resuming {cp}")
-
-        model = GPT2LMHeadModel.from_pretrained(cp).to(device)
-
         state = torch.load(Path(cp) / "optimizer.pt", map_location=device)
-
         optimizer.load_state_dict(state["optimizer"])
-
         step = state["step"]
         tokens_seen = state["tokens"]
-
-    if world > 1:
-        model = DDP(model, device_ids=[local_rank])
 
     l1_loader = infinite_loader(DATASETS["l1"], rank, world)
     l2_loader = infinite_loader(DATASETS["l2"], rank, world)
@@ -313,12 +314,14 @@ def train():
             log(rank, f"step {step} | {tokens_seen/1e9:.2f}B tokens | lr {lr:.2e}")
 
         if step % 500 == 0:
-            save_checkpoint(rank, model, tokenizer, optimizer, step, tokens_seen)
+            # FIX 3: Pass world to save_checkpoint so barrier is called inside
+            save_checkpoint(rank, world, model, tokenizer, optimizer, step, tokens_seen)
 
-    save_checkpoint(rank, model, tokenizer, optimizer, step, tokens_seen)
+    save_checkpoint(rank, world, model, tokenizer, optimizer, step, tokens_seen)
 
     log(rank, "training complete")
 
+    # FIX 4: Always clean up process group
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -326,4 +329,10 @@ def train():
 # ==========================================================
 
 if __name__ == "__main__":
-    train()
+    # FIX 5: Wrap in try/finally so process group is cleaned up even on crash
+    try:
+        train()
+    except Exception:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        raise
