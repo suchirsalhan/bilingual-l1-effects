@@ -4,6 +4,7 @@ import time
 import math
 import glob
 import datetime
+import argparse
 import contextlib
 from pathlib import Path
 
@@ -17,14 +18,26 @@ from datasets import load_dataset
 from huggingface_hub import upload_folder
 
 # ==========================================================
+# ARGUMENT PARSING
+# ==========================================================
+parser = argparse.ArgumentParser()
+parser.param_groups = [] # Dummy for internal compatibility if needed
+parser.add_argument("--lang_l1", type=str, required=True, help="L1 Language code (e.g., tr, zh, es)")
+parser.add_argument("--lang_l2", type=str, default="en", help="L2 Language code (default: en)")
+args = parser.parse_args()
+
+L1 = args.lang_l1
+L2 = args.lang_l2
+PAIR = f"{L1}-{L2}"
+
+# ==========================================================
 # CONFIG
 # ==========================================================
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-REPO_ID = f"{HF_USER}/es-en-bilingual-5B"
-# Dedicated repository for inference-ready L2 English/L1 Spanish models
-CURRICULUM_REPO_ID = f"{HF_USER}/es-en-l1-es-l2-en-curriculum"
-TOKENIZER_ID = f"{HF_USER}/tokenizer-es-en"
+REPO_ID = f"{HF_USER}/{PAIR}-bilingual-5B"
+CURRICULUM_REPO_ID = f"{HF_USER}/{PAIR}-l1-{L1}-l2-{L2}-curriculum"
+TOKENIZER_ID = f"{HF_USER}/tokenizer-{PAIR}"
 
 SEQ_LEN = 512
 TOTAL_TOKENS = 5_000_000_000
@@ -34,7 +47,7 @@ LR_MAX = 2e-4
 WARMUP_FRACTION = 0.01
 VOCAB_SIZE = 50_000
 
-CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_DIR = Path(f"checkpoints_{PAIR}")
 LOG_DIR = Path("logs")
 for d in [CHECKPOINT_DIR, LOG_DIR]:
     d.mkdir(exist_ok=True)
@@ -50,24 +63,19 @@ MODEL_CONFIG = {
     "pad_token_id": 2,
 }
 
+# Assumes dataset naming convention: user/lang1-lang2-5B
 DATASETS = {
-    "es": f"{HF_USER}/es-en-5B", 
-    "en": f"{HF_USER}/en-es-5B"
+    "l1": f"{HF_USER}/{L1}-{L2}-5B", 
+    "l2": f"{HF_USER}/{L2}-{L1}-5B"
 }
 
 PHASE_2_START = TOTAL_TOKENS // 2 
-
-# --- Milestone Definitions ---
-# Phase 1 checkpoints (0, 25, 50, 100% of Phase 1)
 P1_TARGETS = [0.0, 0.125, 0.25, 0.5] 
-
-# Phase 2 Curriculum (L1 Spanish, L2 English)
-# Maps total token fraction to descriptive names
 P2_CURRICULUM = {
-    0.625: "l1-es-l2-en-beginner",      # 25% thru P2
-    0.75:  "l1-es-l2-en-intermediate",  # 50% thru P2
-    0.875: "l1-es-l2-en-advanced",      # 75% thru P2
-    1.0:   "l1-es-l2-en-fluent"         # 100% thru P2
+    0.625: f"l1-{L1}-l2-{L2}-beginner",    
+    0.75:  f"l1-{L1}-l2-{L2}-intermediate",
+    0.875: f"l1-{L1}-l2-{L2}-advanced",    
+    1.0:   f"l1-{L1}-l2-{L2}-fluent"         
 }
 
 ALL_CHECKPOINTS = sorted(set(P1_TARGETS + list(P2_CURRICULUM.keys())))
@@ -117,21 +125,22 @@ def get_infinite_loader(repo, skip_steps):
 # ==========================================================
 def setup():
     if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=7200))
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=7200))
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     else:
-        dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.FileStore("tmp_store", 1))
+        dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.FileStore(f"tmp_store_{PAIR}", 1))
 
 def log(msg):
     if dist.get_rank() == 0:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {msg}"
+        line = f"[{ts}] [{PAIR.upper()}] {msg}"
         print(line)
-        with open(LOG_DIR / "es-en-training.log", "a") as f:
+        with open(LOG_DIR / f"{PAIR}-training.log", "a") as f:
             f.write(line + "\n")
 
 def get_latest_checkpoint():
-    ckpts = glob.glob(str(CHECKPOINT_DIR / "es-en-bilingual-*"))
+    ckpts = glob.glob(str(CHECKPOINT_DIR / f"{PAIR}-bilingual-*"))
     if not ckpts: return None
     return Path(max(ckpts, key=lambda x: int(x.split("-")[-1]) if x.split("-")[-1].isdigit() else 0))
 
@@ -145,7 +154,6 @@ def train():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     world_size = dist.get_world_size()
 
-    # Load shared tokenizer
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True)
 
     conf = GPT2Config(**MODEL_CONFIG)
@@ -163,12 +171,11 @@ def train():
 
     model = DDP(model, device_ids=[local_rank]) if torch.cuda.is_available() else model
 
-    es_loader = get_infinite_loader(DATASETS["es"], start_step)
-    en_loader = get_infinite_loader(DATASETS["en"], start_step)
+    l1_loader = get_infinite_loader(DATASETS["l1"], start_step)
+    l2_loader = get_infinite_loader(DATASETS["l2"], start_step)
 
     tokens_per_step = SEQ_LEN * BATCH_SIZE * world_size * GRAD_ACCUM_STEPS
     warmup_tokens = int(TOTAL_TOKENS * WARMUP_FRACTION)
-    start_time = time.time()
     step = start_step
     
     model.train()
@@ -176,11 +183,13 @@ def train():
     while tokens_seen < TOTAL_TOKENS:
         optimizer.zero_grad(set_to_none=True)
         
-        # Sampling logic
+        # Sampling logic (Curriculum)
         if tokens_seen < PHASE_2_START:
-            loader = es_loader if step % 10 != 0 else en_loader
+            # Phase 1: Heavy L1 (90/10)
+            loader = l1_loader if step % 10 != 0 else l2_loader
         else:
-            loader = es_loader if step % 3 == 0 else en_loader
+            # Phase 2: Mixed (33/66)
+            loader = l1_loader if step % 3 == 0 else l2_loader
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             my_context = model.no_sync() if (isinstance(model, DDP) and micro_step < GRAD_ACCUM_STEPS - 1) else contextlib.nullcontext()
@@ -205,11 +214,10 @@ def train():
             lr = LR_MAX * 0.5 * (1 + math.cos(math.pi * progress))
         for g in optimizer.param_groups: g["lr"] = lr
 
-        # Periodic Logging
         if rank == 0 and step % 20 == 0:
             log(f"Step {step} | {tokens_seen/1e9:.3f}B Tok | LR {lr:.2e}")
 
-        # --- CHECKPOINTING & CURRICULUM PUSH ---
+        # --- CHECKPOINTING ---
         fraction = tokens_seen / TOTAL_TOKENS
         for cp_frac in ALL_CHECKPOINTS:
             if fraction >= cp_frac and cp_frac not in saved_checkpoints:
@@ -218,8 +226,7 @@ def train():
                     saved_checkpoints.add(cp_frac)
                     pct = int(cp_frac * 100)
                     
-                    # Local save
-                    folder_name = f"es-en-bilingual-{pct}"
+                    folder_name = f"{PAIR}-bilingual-{pct}"
                     cp_path = CHECKPOINT_DIR / folder_name
                     cp_path.mkdir(parents=True, exist_ok=True)
 
@@ -235,25 +242,22 @@ def train():
                     log(f"💾 Checkpoint: {pct}%")
                     
                     if HF_TOKEN:
-                        # 1. Push to main training repo
                         try:
                             upload_folder(folder_path=str(cp_path), repo_id=REPO_ID, token=HF_TOKEN)
-                            
-                            # 2. Push to L1/L2 Curriculum repo if it's a P2 Milestone
                             if cp_frac in P2_CURRICULUM:
                                 label = P2_CURRICULUM[cp_frac]
                                 log(f"🚀 Pushing curriculum milestone: {label}")
                                 upload_folder(
                                     folder_path=str(cp_path),
                                     repo_id=CURRICULUM_REPO_ID,
-                                    path_in_repo=label, # Organized by label folder
+                                    path_in_repo=label,
                                     token=HF_TOKEN
                                 )
                         except Exception as e:
                             log(f"⚠️ Upload failed: {e}")
                 dist.barrier()
 
-    if rank == 0: log("✅ Training Complete.")
+    if rank == 0: log(f"✅ Training Complete for {PAIR}.")
     dist.destroy_process_group()
 
 if __name__ == "__main__":
