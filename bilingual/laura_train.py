@@ -22,8 +22,8 @@ from huggingface_hub import upload_folder
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 REPO_ID = f"{HF_USER}/es-en-bilingual-5B"
-# New repository for finalized Phase 2 curriculum models
-CURRICULUM_REPO_ID = f"{HF_USER}/es-en-curriculum-checkpoints"
+# Dedicated repository for inference-ready L2 English/L1 Spanish models
+CURRICULUM_REPO_ID = f"{HF_USER}/es-en-l1-es-l2-en-curriculum"
 TOKENIZER_ID = f"{HF_USER}/tokenizer-es-en"
 
 SEQ_LEN = 512
@@ -57,22 +57,24 @@ DATASETS = {
 
 PHASE_2_START = TOTAL_TOKENS // 2 
 
-# --- Updated Checkpoint Logic ---
-# Phase 1: 0, 25, 50, 100% of Phase 1 (0 to 0.5 of total)
-PHASE_1_STEPS = [0.0, 0.125, 0.25, 0.5] 
-# Phase 2: Specific milestones with descriptive names
-PHASE_2_MAPPING = {
-    0.625: "l1-l2-beginner",    # 25% through P2
-    0.75:  "l1-l2-intermediate",# 50% through P2
-    0.875: "l1-l2-advanced",    # 75% through P2
-    1.0:   "l1-l2-fluent"       # 100% through P2
+# --- Milestone Definitions ---
+# Phase 1 checkpoints (0, 25, 50, 100% of Phase 1)
+P1_TARGETS = [0.0, 0.125, 0.25, 0.5] 
+
+# Phase 2 Curriculum (L1 Spanish, L2 English)
+# Maps total token fraction to descriptive names
+P2_CURRICULUM = {
+    0.625: "l1-es-l2-en-beginner",      # 25% thru P2
+    0.75:  "l1-es-l2-en-intermediate",  # 50% thru P2
+    0.875: "l1-es-l2-en-advanced",      # 75% thru P2
+    1.0:   "l1-es-l2-en-fluent"         # 100% thru P2
 }
 
-CHECKPOINT_PERCENTAGES = sorted(set(PHASE_1_STEPS + list(PHASE_2_MAPPING.keys())))
+ALL_CHECKPOINTS = sorted(set(P1_TARGETS + list(P2_CURRICULUM.keys())))
 saved_checkpoints = set()
 
 # ==========================================================
-# DATASET & LOADER (Unchanged)
+# DATASET & LOADER
 # ==========================================================
 class BilingualParquetDataset(IterableDataset):
     def __init__(self, repo, skip_steps=0):
@@ -118,7 +120,6 @@ def setup():
         dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=7200))
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     else:
-        print("⚠️ Not in distributed mode. Running locally.")
         dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.FileStore("tmp_store", 1))
 
 def log(msg):
@@ -131,8 +132,7 @@ def log(msg):
 
 def get_latest_checkpoint():
     ckpts = glob.glob(str(CHECKPOINT_DIR / "es-en-bilingual-*"))
-    if not ckpts:
-        return None
+    if not ckpts: return None
     return Path(max(ckpts, key=lambda x: int(x.split("-")[-1]) if x.split("-")[-1].isdigit() else 0))
 
 # ==========================================================
@@ -145,6 +145,7 @@ def train():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     world_size = dist.get_world_size()
 
+    # Load shared tokenizer
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True)
 
     conf = GPT2Config(**MODEL_CONFIG)
@@ -159,7 +160,6 @@ def train():
         ckpt_data = torch.load(latest_cp / "optimizer.pt", map_location=device)
         optimizer.load_state_dict(ckpt_data["optimizer_state_dict"])
         start_step, tokens_seen = ckpt_data["step"], ckpt_data["tokens_seen"]
-        log(f"📈 Resuming at {tokens_seen/1e9:.2f}B tokens")
 
     model = DDP(model, device_ids=[local_rank]) if torch.cuda.is_available() else model
 
@@ -176,6 +176,7 @@ def train():
     while tokens_seen < TOTAL_TOKENS:
         optimizer.zero_grad(set_to_none=True)
         
+        # Sampling logic
         if tokens_seen < PHASE_2_START:
             loader = es_loader if step % 10 != 0 else en_loader
         else:
@@ -183,7 +184,6 @@ def train():
 
         for micro_step in range(GRAD_ACCUM_STEPS):
             my_context = model.no_sync() if (isinstance(model, DDP) and micro_step < GRAD_ACCUM_STEPS - 1) else contextlib.nullcontext()
-            
             with my_context:
                 batch = next(loader).to(device, non_blocking=True)
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -197,31 +197,28 @@ def train():
         tokens_seen += tokens_per_step
         step += 1
 
-        # Learning Rate Schedule
+        # LR Schedule
         if tokens_seen < warmup_tokens:
             lr = LR_MAX * (tokens_seen / warmup_tokens)
         else:
             progress = (tokens_seen - warmup_tokens) / (TOTAL_TOKENS - warmup_tokens)
             lr = LR_MAX * 0.5 * (1 + math.cos(math.pi * progress))
-        
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+        for g in optimizer.param_groups: g["lr"] = lr
 
+        # Periodic Logging
         if rank == 0 and step % 20 == 0:
-            elapsed = time.time() - start_time
-            tok_sec = (tokens_seen - (start_step * tokens_per_step)) / max(elapsed, 1)
-            log(f"Step {step} | {tokens_seen/1e9:.3f}B Tok | {tok_sec:,.0f} tok/s | LR {lr:.2e}")
+            log(f"Step {step} | {tokens_seen/1e9:.3f}B Tok | LR {lr:.2e}")
 
-        # --- UPDATED CHECKPOINTING SECTION ---
+        # --- CHECKPOINTING & CURRICULUM PUSH ---
         fraction = tokens_seen / TOTAL_TOKENS
-        for cp_frac in CHECKPOINT_PERCENTAGES:
+        for cp_frac in ALL_CHECKPOINTS:
             if fraction >= cp_frac and cp_frac not in saved_checkpoints:
                 dist.barrier()
                 if rank == 0:
                     saved_checkpoints.add(cp_frac)
                     pct = int(cp_frac * 100)
                     
-                    # Local path naming
+                    # Local save
                     folder_name = f"es-en-bilingual-{pct}"
                     cp_path = CHECKPOINT_DIR / folder_name
                     cp_path.mkdir(parents=True, exist_ok=True)
@@ -231,35 +228,32 @@ def train():
                     tokenizer.save_pretrained(cp_path)
 
                     torch.save({
-                        "step": step,
-                        "tokens_seen": tokens_seen,
+                        "step": step, "tokens_seen": tokens_seen,
                         "optimizer_state_dict": optimizer.state_dict()
                     }, cp_path / "optimizer.pt")
 
-                    log(f"💾 Checkpoint saved: {pct}%")
+                    log(f"💾 Checkpoint: {pct}%")
                     
                     if HF_TOKEN:
-                        # Upload to main training repo
+                        # 1. Push to main training repo
                         try:
                             upload_folder(folder_path=str(cp_path), repo_id=REPO_ID, token=HF_TOKEN)
                             
-                            # Upload to Curriculum repo if it's a Phase 2 milestone
-                            if cp_frac in PHASE_2_MAPPING:
-                                curr_name = PHASE_2_MAPPING[cp_frac]
-                                log(f"🌟 Phase 2 Milestone detected: {curr_name}")
+                            # 2. Push to L1/L2 Curriculum repo if it's a P2 Milestone
+                            if cp_frac in P2_CURRICULUM:
+                                label = P2_CURRICULUM[cp_frac]
+                                log(f"🚀 Pushing curriculum milestone: {label}")
                                 upload_folder(
-                                    folder_path=str(cp_path), 
-                                    repo_id=CURRICULUM_REPO_ID, 
-                                    path_in_repo=curr_name, # Nested within curriculum repo
+                                    folder_path=str(cp_path),
+                                    repo_id=CURRICULUM_REPO_ID,
+                                    path_in_repo=label, # Organized by label folder
                                     token=HF_TOKEN
                                 )
-                                log(f"🚀 Uploaded {curr_name} to {CURRICULUM_REPO_ID}")
                         except Exception as e:
                             log(f"⚠️ Upload failed: {e}")
                 dist.barrier()
 
-    if rank == 0:
-        log("✅ Training Complete.")
+    if rank == 0: log("✅ Training Complete.")
     dist.destroy_process_group()
 
 if __name__ == "__main__":
