@@ -22,7 +22,7 @@ OUT_DIR.mkdir(exist_ok=True)
 # =====================================================
 def get_training_corpus():
     es_ds = load_dataset("uonlp/CulturaX", "es", split="train", streaming=True)
-    en_ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+    en_ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
     
     es_iter, en_iter = iter(es_ds), iter(en_ds)
     for _ in range(BOOTSTRAP_SENTENCES // 2):
