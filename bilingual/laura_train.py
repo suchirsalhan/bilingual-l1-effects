@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import optim
 from torch.utils.data import DataLoader, IterableDataset
-from transformers import GPT2Config, GPT2LMHeadModel, AutoTokenizer # Added AutoTokenizer
+from transformers import GPT2Config, GPT2LMHeadModel, AutoTokenizer
 from datasets import load_dataset
 from huggingface_hub import upload_folder
 
@@ -22,7 +22,10 @@ from huggingface_hub import upload_folder
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 REPO_ID = f"{HF_USER}/es-en-bilingual-5B"
+# New repository for finalized Phase 2 curriculum models
+CURRICULUM_REPO_ID = f"{HF_USER}/es-en-curriculum-checkpoints"
 TOKENIZER_ID = f"{HF_USER}/tokenizer-es-en"
+
 SEQ_LEN = 512
 TOTAL_TOKENS = 5_000_000_000
 GRAD_ACCUM_STEPS = 8
@@ -53,13 +56,23 @@ DATASETS = {
 }
 
 PHASE_2_START = TOTAL_TOKENS // 2 
-BASE_CHECKPOINTS = [0.25, 0.5, 0.75, 1.0]
-LOG_CHECKPOINTS = [2 ** i / 100 for i in range(0, 7)]
-CHECKPOINT_PERCENTAGES = sorted(set(BASE_CHECKPOINTS + LOG_CHECKPOINTS))
+
+# --- Updated Checkpoint Logic ---
+# Phase 1: 0, 25, 50, 100% of Phase 1 (0 to 0.5 of total)
+PHASE_1_STEPS = [0.0, 0.125, 0.25, 0.5] 
+# Phase 2: Specific milestones with descriptive names
+PHASE_2_MAPPING = {
+    0.625: "l1-l2-beginner",    # 25% through P2
+    0.75:  "l1-l2-intermediate",# 50% through P2
+    0.875: "l1-l2-advanced",    # 75% through P2
+    1.0:   "l1-l2-fluent"       # 100% through P2
+}
+
+CHECKPOINT_PERCENTAGES = sorted(set(PHASE_1_STEPS + list(PHASE_2_MAPPING.keys())))
 saved_checkpoints = set()
 
 # ==========================================================
-# DATASET & LOADER
+# DATASET & LOADER (Unchanged)
 # ==========================================================
 class BilingualParquetDataset(IterableDataset):
     def __init__(self, repo, skip_steps=0):
@@ -120,7 +133,7 @@ def get_latest_checkpoint():
     ckpts = glob.glob(str(CHECKPOINT_DIR / "es-en-bilingual-*"))
     if not ckpts:
         return None
-    return Path(max(ckpts, key=lambda x: int(x.split("-")[-1])))
+    return Path(max(ckpts, key=lambda x: int(x.split("-")[-1]) if x.split("-")[-1].isdigit() else 0))
 
 # ==========================================================
 # TRAINING LOOP
@@ -132,15 +145,7 @@ def train():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     world_size = dist.get_world_size()
 
-    # --- TOKENIZER INITIALIZATION ---
-    # We load it here so it is in scope for the checkpointing block
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True)
-
-    for cp in glob.glob(str(CHECKPOINT_DIR / "es-en-bilingual-*")):
-        try:
-            pct_val = int(cp.split("-")[-1]) / 100.0
-            saved_checkpoints.add(pct_val)
-        except ValueError: continue
 
     conf = GPT2Config(**MODEL_CONFIG)
     model = GPT2LMHeadModel(conf).to(device)
@@ -192,6 +197,7 @@ def train():
         tokens_seen += tokens_per_step
         step += 1
 
+        # Learning Rate Schedule
         if tokens_seen < warmup_tokens:
             lr = LR_MAX * (tokens_seen / warmup_tokens)
         else:
@@ -214,13 +220,14 @@ def train():
                 if rank == 0:
                     saved_checkpoints.add(cp_frac)
                     pct = int(cp_frac * 100)
-                    cp_path = CHECKPOINT_DIR / f"es-en-bilingual-{pct}"
+                    
+                    # Local path naming
+                    folder_name = f"es-en-bilingual-{pct}"
+                    cp_path = CHECKPOINT_DIR / folder_name
                     cp_path.mkdir(parents=True, exist_ok=True)
 
                     model_to_save = model.module if hasattr(model, "module") else model
                     model_to_save.save_pretrained(cp_path, safe_serialization=False)
-                    
-                    # ✅ Save tokenizer too for HF pipeline/Trainer compatibility
                     tokenizer.save_pretrained(cp_path)
 
                     torch.save({
@@ -229,12 +236,24 @@ def train():
                         "optimizer_state_dict": optimizer.state_dict()
                     }, cp_path / "optimizer.pt")
 
-                    log(f"💾 Checkpoint saved: {pct}% (inc. tokenizer)")
+                    log(f"💾 Checkpoint saved: {pct}%")
                     
                     if HF_TOKEN:
+                        # Upload to main training repo
                         try:
                             upload_folder(folder_path=str(cp_path), repo_id=REPO_ID, token=HF_TOKEN)
-                            log(f"🚀 Uploaded to HF: {REPO_ID}")
+                            
+                            # Upload to Curriculum repo if it's a Phase 2 milestone
+                            if cp_frac in PHASE_2_MAPPING:
+                                curr_name = PHASE_2_MAPPING[cp_frac]
+                                log(f"🌟 Phase 2 Milestone detected: {curr_name}")
+                                upload_folder(
+                                    folder_path=str(cp_path), 
+                                    repo_id=CURRICULUM_REPO_ID, 
+                                    path_in_repo=curr_name, # Nested within curriculum repo
+                                    token=HF_TOKEN
+                                )
+                                log(f"🚀 Uploaded {curr_name} to {CURRICULUM_REPO_ID}")
                         except Exception as e:
                             log(f"⚠️ Upload failed: {e}")
                 dist.barrier()
