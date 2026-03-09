@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Production-ready multi-GPU pretokenizer + async shard uploader.
+Memory-safe multi-GPU pretokenizer + async shard uploader.
 
 Features:
-- Async upload thread to Hugging Face Hub
-- Fully resumable shard IDs
-- Shards written locally in /tmp, uploaded in batches
-- Safe retries with exponential backoff
+- Async upload thread to Hugging Face Hub with retries
+- Fully resumable shard IDs per rank
+- Memory-limited token buffer
+- /tmp free space safety check
+- Optional NVMe temp directory
 - Multi-GPU safe (WORLD_SIZE & LOCAL_RANK)
-- Final cleanup of temporary folder
 """
 
 import os
@@ -17,6 +17,7 @@ import argparse
 import shutil
 import threading
 from pathlib import Path
+import queue
 
 import numpy as np
 import pyarrow as pa
@@ -25,7 +26,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 from huggingface_hub import HfApi, create_repo
 from tqdm import tqdm
-import queue
+import shutil
 
 # ------------------------------
 # ARGUMENTS
@@ -36,6 +37,7 @@ parser.add_argument("--seq_len", type=int, default=512)
 parser.add_argument("--shard_seqs", type=int, default=50_000)
 parser.add_argument("--tokenizer_batch", type=int, default=20_000)
 parser.add_argument("--upload_batch", type=int, default=40)
+parser.add_argument("--nvme_tmp", type=str, default=None, help="Optional NVMe mount for temp shards")
 args = parser.parse_args()
 
 L1 = args.lang_l1
@@ -44,6 +46,7 @@ SHARD_SEQS = args.shard_seqs
 TOKENIZER_BATCH = args.tokenizer_batch
 UPLOAD_BATCH = args.upload_batch
 TOKENS_PER_SHARD = SEQ_LEN * SHARD_SEQS
+MAX_BUFFER_SHARDS = 2  # Max shards held in memory at once
 
 # ------------------------------
 # HF SETTINGS
@@ -67,18 +70,16 @@ def log(msg):
     print(f"[Rank {LOCAL_RANK}] {msg}", flush=True)
 
 api = HfApi(token=HF_TOKEN)
-upload_queue = queue.Queue()
+upload_queue = queue.Queue(maxsize=UPLOAD_BATCH*WORLD_SIZE)  # limit memory
 
 # ------------------------------
 # ASYNC UPLOADER THREAD
 # ------------------------------
 def uploader(repo_id):
-    """Upload shards asynchronously from the queue with retries."""
     while True:
         fname = upload_queue.get()
         if fname is None:
             break
-
         retries = 0
         while retries < 5:
             try:
@@ -122,18 +123,26 @@ def write_shard(tokens, shard_id, lang, tmp_dir):
 # PIPELINE
 # ------------------------------
 def run_pipeline(lang, target_tokens, tokenizer, repo_id):
-    tmp_dir = Path(f"/tmp/hf_shards_{lang}_rank{LOCAL_RANK}")
-    tmp_dir.mkdir(exist_ok=True)
-    log(f"Temporary shard dir: {tmp_dir}")
+    # Setup temp dir
+    tmp_base = Path(args.nvme_tmp) if args.nvme_tmp else Path("/tmp")
+    tmp_dir = tmp_base / f"hf_shards_{lang}_rank{LOCAL_RANK}"
+    tmp_dir.mkdir(exist_ok=True, parents=True)
+
+    # Pre-flight /tmp space check
+    usage = shutil.disk_usage(str(tmp_dir))
+    needed_bytes = TOKENS_PER_SHARD * 4 * MAX_BUFFER_SHARDS  # 4 bytes per token
+    if usage.free < needed_bytes:
+        raise RuntimeError(f"/tmp has {usage.free/1e9:.2f} GB free, need at least {needed_bytes/1e9:.2f} GB")
+    log(f"/tmp free space OK: {usage.free/1e9:.2f} GB")
 
     # Flush leftover shards
-    while list(tmp_dir.glob("*.parquet")):
-        log("Uploading leftover shards before starting...")
-        for f in list(tmp_dir.glob("*.parquet")):
-            upload_queue.put(f)
-        time.sleep(1)
+    leftover_shards = list(tmp_dir.glob("*.parquet"))
+    for f in leftover_shards:
+        upload_queue.put(f)
+    if leftover_shards:
+        log(f"Flushed {len(leftover_shards)} leftover shards")
 
-    # Determine starting shard based on existing shards
+    # Determine starting shard ID
     existing_shards = list(tmp_dir.glob(f"{lang}_train_*_rank{LOCAL_RANK}.parquet"))
     if existing_shards:
         max_id = max(int(f.stem.split("_")[2]) for f in existing_shards)
@@ -144,8 +153,8 @@ def run_pipeline(lang, target_tokens, tokenizer, repo_id):
     per_rank_target = target_tokens // WORLD_SIZE
     tokens_seen = 0
     buffer = np.empty(0, dtype=np.int32)
-    stream = iter(get_stream(lang))
 
+    stream = iter(get_stream(lang))
     pbar = tqdm(total=per_rank_target, unit="tok", unit_scale=True,
                 desc=f"{lang}-R{LOCAL_RANK}", position=LOCAL_RANK)
 
@@ -163,13 +172,23 @@ def run_pipeline(lang, target_tokens, tokenizer, repo_id):
         tokens = np.concatenate([np.array(ids, dtype=np.int32) for ids in enc["input_ids"]])
         buffer = np.concatenate([buffer, tokens])
 
-        while buffer.size >= TOKENS_PER_SHARD:
+        # Write shards while limiting memory
+        while buffer.size >= TOKENS_PER_SHARD and buffer.size >= TOKENS_PER_SHARD * MAX_BUFFER_SHARDS:
             shard_tokens = buffer[:TOKENS_PER_SHARD]
             buffer = buffer[TOKENS_PER_SHARD:]
             write_shard(shard_tokens, shard, lang, tmp_dir)
             shard += WORLD_SIZE
             tokens_seen += TOKENS_PER_SHARD
             pbar.update(TOKENS_PER_SHARD)
+
+    # Flush remaining tokens
+    while buffer.size >= TOKENS_PER_SHARD:
+        shard_tokens = buffer[:TOKENS_PER_SHARD]
+        buffer = buffer[TOKENS_PER_SHARD:]
+        write_shard(shard_tokens, shard, lang, tmp_dir)
+        shard += WORLD_SIZE
+        tokens_seen += TOKENS_PER_SHARD
+        pbar.update(TOKENS_PER_SHARD)
 
     pbar.close()
     log(f"Finished {lang} tokenization")
@@ -184,7 +203,7 @@ def main():
     for lang, target in TARGETS.items():
         repo_id = f"{HF_USER}/{REPOS[lang]}"
 
-        # Only rank 0 creates repo
+        # Rank 0 creates repo
         if LOCAL_RANK == 0:
             create_repo(repo_id, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
 
@@ -197,7 +216,7 @@ def main():
                 log("Waiting for repo creation...")
                 time.sleep(2)
 
-        # Start async uploader thread
+        # Start async uploader
         t = threading.Thread(target=uploader, args=(repo_id,), daemon=True)
         t.start()
 
@@ -212,7 +231,7 @@ def main():
             time.sleep(1)
 
         # Cleanup tmp
-        tmp_dir = Path(f"/tmp/hf_shards_{lang}_rank{LOCAL_RANK}")
+        tmp_dir = (Path(args.nvme_tmp) if args.nvme_tmp else Path("/tmp")) / f"hf_shards_{lang}_rank{LOCAL_RANK}"
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
 
