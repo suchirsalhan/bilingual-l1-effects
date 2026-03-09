@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
-Stable multi-GPU pretokenizer with batch HF uploads to avoid API limits.
-Run with:
-torchrun --nproc_per_node=8 ./tokenizers/pretokenize_batch_upload.py --lang_l1 fr --seq_len 512
+End-to-end tokenizer factory + shard uploader.
+
+Features
+--------
+• vectorized tokenization
+• Arrow FixedSizeListArray shards
+• tmp shard folder
+• batch uploads to HF
+• exponential retry
+• shards deleted only after successful upload
+• resumable if HF fails
+• multi-GPU safe
+
+Run:
+torchrun --nproc_per_node=8 tokenizer_factory.py --lang_l1 fr
 """
 
 import os
-import sys
 import time
-import csv
-import threading
 import argparse
-from pathlib import Path
 import tempfile
 import shutil
+from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import load_dataset
@@ -22,239 +32,269 @@ from transformers import AutoTokenizer
 from huggingface_hub import HfApi, create_repo
 from tqdm import tqdm
 
-# ----------------------------------------------------
+
+# ------------------------------------------------
 # ARGUMENTS
-# ----------------------------------------------------
+# ------------------------------------------------
+
 parser = argparse.ArgumentParser()
+
 parser.add_argument("--lang_l1", type=str, default="es")
 parser.add_argument("--seq_len", type=int, default=512)
-parser.add_argument("--shard_seqs", type=int, default=50_000, help="Number of sequences per shard")
-parser.add_argument("--tokenizer_batch", type=int, default=20_000)
-parser.add_argument("--upload_batch_size", type=int, default=10, help="Number of shards per HF upload batch")
+parser.add_argument("--shard_seqs", type=int, default=50000)
+parser.add_argument("--tokenizer_batch", type=int, default=20000)
+parser.add_argument("--upload_batch", type=int, default=40)
+
 args = parser.parse_args()
 
 L1 = args.lang_l1
 SEQ_LEN = args.seq_len
 SHARD_SEQS = args.shard_seqs
 TOKENIZER_BATCH = args.tokenizer_batch
-UPLOAD_BATCH_SIZE = args.upload_batch_size
-TOKENS_PER_SHARD = SHARD_SEQS * SEQ_LEN
+UPLOAD_BATCH = args.upload_batch
+
+TOKENS_PER_SHARD = SEQ_LEN * SHARD_SEQS
+
+
+# ------------------------------------------------
+# HF SETTINGS
+# ------------------------------------------------
 
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN")
+
 if HF_TOKEN is None:
-    raise RuntimeError("HF_TOKEN environment variable not set!")
+    raise RuntimeError("HF_TOKEN not set")
 
 TOKENIZER_ID = f"{HF_USER}/tokenizer-{L1}-en"
+
 
 TARGETS = {
     L1: 3_500_000_000,
     "en": 2_500_000_000
 }
 
-REPO_NAMING = {
+REPOS = {
     L1: f"{L1}-en-5B",
     "en": f"en-{L1}-5B"
 }
 
-OUT_DIR = Path("parquet_factory")
-OUT_DIR.mkdir(exist_ok=True)
 
-# ----------------------------------------------------
+# ------------------------------------------------
 # DISTRIBUTED INFO
-# ----------------------------------------------------
+# ------------------------------------------------
+
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
-RANK = int(os.environ.get("RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 
-LOG_FILE = OUT_DIR / f"stats_{L1}_rank{LOCAL_RANK}.csv"
-if not LOG_FILE.exists():
-    with open(LOG_FILE, "w", newline="") as f:
-        csv.writer(f).writerow(["timestamp", "lang", "shard", "tokens", "sec", "tok_per_sec"])
 
-# HF API
-api = HfApi(token=HF_TOKEN)
-
-# ----------------------------------------------------
-# DEBUGGING HELPER
-# ----------------------------------------------------
-def debug_print(msg):
+def log(msg):
     print(f"[Rank {LOCAL_RANK}] {msg}", flush=True)
 
-# ----------------------------------------------------
-# UPLOADER WITH BATCHES
-# ----------------------------------------------------
-def upload_batch(folder: Path, repo_id: str, max_retries=5, base_delay=2):
-    """
-    Upload all files in `folder` to HF repo in a single batch commit.
-    Uses exponential backoff on failures.
-    """
-    files = sorted(folder.glob("*.parquet"))
+
+api = HfApi(token=HF_TOKEN)
+
+
+# ------------------------------------------------
+# SAFE HF UPLOAD
+# ------------------------------------------------
+
+def upload_tmp_shards(tmp_dir, repo_id):
+
+    files = sorted(tmp_dir.glob("*.parquet"))
+
     if not files:
         return
 
-    for f in files:
-        retries = 0
-        while retries <= max_retries:
-            try:
-                api.upload_file(
-                    path_or_fileobj=str(f),
-                    path_in_repo=f.name,
-                    repo_id=repo_id,
-                    repo_type="dataset"
-                )
-                debug_print(f"Uploaded {f.name}")
+    batch = files[:UPLOAD_BATCH]
+
+    log(f"Uploading batch of {len(batch)} shards")
+
+    retries = 0
+
+    while True:
+
+        try:
+
+            api.upload_folder(
+                folder_path=str(tmp_dir),
+                repo_id=repo_id,
+                repo_type="dataset",
+                allow_patterns=[f.name for f in batch],
+            )
+
+            for f in batch:
                 f.unlink()
-                time.sleep(1)  # small delay to avoid HF rate limit
-                break
-            except Exception as e:
-                retries += 1
-                wait_time = base_delay * (2 ** (retries - 1))
-                debug_print(f"Upload failed ({retries}/{max_retries}) for {f.name}: {e}")
-                if retries > max_retries:
-                    debug_print(f"Max retries exceeded for {f.name}, skipping.")
-                    break
-                debug_print(f"Retrying in {wait_time:.1f}s...")
-                time.sleep(wait_time)
 
-# ----------------------------------------------------
-# LOGGING
-# ----------------------------------------------------
-def log_stats(lang, shard, tokens, sec):
-    rate = tokens / sec if sec > 0 else 0
-    with open(LOG_FILE, "a", newline="") as f:
-        csv.writer(f).writerow([
-            time.strftime("%Y-%m-%d %H:%M:%S"),
-            lang,
-            shard,
-            tokens,
-            f"{sec:.2f}",
-            int(rate)
-        ])
+            log("Upload success")
 
-# ----------------------------------------------------
+            time.sleep(5)
+
+            return
+
+        except Exception as e:
+
+            retries += 1
+            wait = min(120, 2 ** retries)
+
+            log(f"Upload failed retry={retries} wait={wait}s")
+
+            time.sleep(wait)
+
+
+# ------------------------------------------------
 # DATA STREAM
-# ----------------------------------------------------
+# ------------------------------------------------
+
 def get_stream(lang):
-    try:
-        if lang == L1:
-            return load_dataset("uonlp/CulturaX", L1, split="train", streaming=True)
-        else:
-            return load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
-    except Exception as e:
-        debug_print(f"Dataset load failed: {e}")
-        sys.exit(1)
 
-# ----------------------------------------------------
-# SHARD WRITER
-# ----------------------------------------------------
-def write_shard(token_array, shard_id, lang, tmp_folder):
-    fname = tmp_folder / f"{lang}_train_{shard_id:05d}_rank{LOCAL_RANK}.parquet"
-    try:
-        table = pa.Table.from_arrays([token_array], names=["input_ids"])
-        pq.write_table(table, fname, compression="zstd", row_group_size=4096)
-        return fname
-    except Exception as e:
-        debug_print(f"Shard write failed: {e}")
-        sys.exit(1)
+    if lang == L1:
 
-# ----------------------------------------------------
-# MAIN PIPELINE PER RANK
-# ----------------------------------------------------
+        return load_dataset(
+            "uonlp/CulturaX",
+            lang,
+            split="train",
+            streaming=True
+        )
+
+    return load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        split="train",
+        streaming=True
+    )
+
+
+# ------------------------------------------------
+# WRITE SHARD
+# ------------------------------------------------
+
+def write_shard(tokens, shard_id, lang, tmp_dir):
+
+    flat = pa.array(tokens, type=pa.int32())
+
+    arr = pa.FixedSizeListArray.from_arrays(flat, SEQ_LEN)
+
+    table = pa.Table.from_arrays([arr], names=["input_ids"])
+
+    fname = tmp_dir / f"{lang}_train_{shard_id:06d}_rank{LOCAL_RANK}.parquet"
+
+    pq.write_table(
+        table,
+        fname,
+        compression="zstd",
+        row_group_size=4096
+    )
+
+    return fname
+
+
+# ------------------------------------------------
+# PIPELINE
+# ------------------------------------------------
+
 def run_pipeline(lang, target_tokens, tokenizer, repo_id):
-    debug_print(f"Starting processing {lang} → {repo_id}")
+
     stream = iter(get_stream(lang))
-    shard = LOCAL_RANK  # start shard offset by rank
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"hf_shards_rank{LOCAL_RANK}_"))
+
+    log(f"Temporary shard dir: {tmp_dir}")
+
+    shard = LOCAL_RANK
     tokens_seen = 0
-    flat_tokens = []
-    shard_start = time.perf_counter()
 
-    tmp_folder = Path(tempfile.mkdtemp(prefix=f"rank{LOCAL_RANK}_"))
-    debug_print(f"Temporary shard folder: {tmp_folder}")
+    buffer = np.empty(0, dtype=np.int32)
 
-    pbar = tqdm(total=target_tokens, unit="tok",
-                desc=f"{lang}-R{LOCAL_RANK}", unit_scale=True, position=LOCAL_RANK)
-
-    shards_in_batch = []
+    pbar = tqdm(
+        total=target_tokens,
+        unit="tok",
+        unit_scale=True,
+        desc=f"{lang}-R{LOCAL_RANK}",
+        position=LOCAL_RANK
+    )
 
     while tokens_seen < target_tokens:
+
         texts = []
-        try:
-            for _ in range(TOKENIZER_BATCH):
-                texts.append(next(stream)["text"])
-        except StopIteration:
-            if not texts:
-                break
-        except Exception as e:
-            debug_print(f"Error fetching texts: {e}")
-            sys.exit(1)
 
-        try:
-            enc = tokenizer(texts, add_special_tokens=False, truncation=False)
-        except Exception as e:
-            debug_print(f"Tokenizer failed: {e}")
-            sys.exit(1)
+        for _ in range(TOKENIZER_BATCH):
 
-        for ids in enc["input_ids"]:
-            flat_tokens.extend(ids)
-
-        while len(flat_tokens) >= TOKENS_PER_SHARD:
-            shard_tokens = flat_tokens[:TOKENS_PER_SHARD]
-            flat_tokens = flat_tokens[TOKENS_PER_SHARD:]
             try:
-                arr = pa.FixedSizeListArray.from_arrays(pa.array(shard_tokens, type=pa.int32()), SEQ_LEN)
-            except Exception as e:
-                debug_print(f"FixedSizeListArray creation failed: {e}")
-                sys.exit(1)
+                texts.append(next(stream)["text"])
+            except StopIteration:
+                break
 
-            fname = write_shard(arr, shard, lang, tmp_folder)
-            shards_in_batch.append(fname)
+        if not texts:
+            break
 
-            # Upload batch if threshold reached
-            if len(shards_in_batch) >= UPLOAD_BATCH_SIZE:
-                upload_batch(tmp_folder, repo_id)
-                shards_in_batch = []
+        enc = tokenizer(
+            texts,
+            add_special_tokens=False,
+            return_attention_mask=False
+        )
 
-            duration = time.perf_counter() - shard_start
-            log_stats(lang, shard, TOKENS_PER_SHARD, duration)
+        tokens = np.concatenate(enc["input_ids"]).astype(np.int32)
+
+        buffer = np.concatenate([buffer, tokens])
+
+        while buffer.size >= TOKENS_PER_SHARD:
+
+            shard_tokens = buffer[:TOKENS_PER_SHARD]
+            buffer = buffer[TOKENS_PER_SHARD:]
+
+            write_shard(shard_tokens, shard, lang, tmp_dir)
+
+            shard += WORLD_SIZE
+
             tokens_seen += TOKENS_PER_SHARD
-            shard += WORLD_SIZE  # next shard for this rank
+
             pbar.update(TOKENS_PER_SHARD)
-            shard_start = time.perf_counter()
 
-    # Upload any remaining shards
-    if shards_in_batch:
-        upload_batch(tmp_folder, repo_id)
+            if len(list(tmp_dir.glob("*.parquet"))) >= UPLOAD_BATCH:
 
-    # Remove temporary folder
-    shutil.rmtree(tmp_folder)
+                upload_tmp_shards(tmp_dir, repo_id)
+
+    # final upload
+    upload_tmp_shards(tmp_dir, repo_id)
+
+    log("Cleaning tmp dir")
+
+    shutil.rmtree(tmp_dir)
+
     pbar.close()
-    debug_print(f"Finished {lang}")
 
-# ----------------------------------------------------
+
+# ------------------------------------------------
 # MAIN
-# ----------------------------------------------------
+# ------------------------------------------------
+
 def main():
-    debug_print(f"Loading tokenizer {TOKENIZER_ID}")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True, token=HF_TOKEN)
-    except Exception as e:
-        debug_print(f"Tokenizer load failed: {e}")
-        sys.exit(1)
+
+    log("Loading tokenizer")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        TOKENIZER_ID,
+        use_fast=True,
+        token=HF_TOKEN
+    )
 
     for lang, target in TARGETS.items():
-        repo_name = REPO_NAMING[lang]
-        repo_id = f"{HF_USER}/{repo_name}"
+
+        repo_id = f"{HF_USER}/{REPOS[lang]}"
+
         if LOCAL_RANK == 0:
-            try:
-                create_repo(repo_id, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
-            except Exception as e:
-                debug_print(f"Repo creation failed: {e}")
-                sys.exit(1)
+
+            create_repo(
+                repo_id,
+                repo_type="dataset",
+                exist_ok=True,
+                token=HF_TOKEN
+            )
 
         run_pipeline(lang, target, tokenizer, repo_id)
 
-    debug_print("Dataset generation complete.")
+    log("Dataset creation complete")
+
 
 if __name__ == "__main__":
     main()
