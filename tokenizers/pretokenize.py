@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Stable multi-GPU pretokenizer for large datasets.
-Safer shard sizes, full debugging output, rank-safe repo creation.
+Stable multi-GPU pretokenizer with batch HF uploads to avoid API limits.
 Run with:
-torchrun --nproc_per_node=8 ./tokenizers/pretokenize_safe.py --lang_l1 fr --seq_len 512
+torchrun --nproc_per_node=8 ./tokenizers/pretokenize_batch_upload.py --lang_l1 fr --seq_len 512
 """
 
 import os
 import sys
 import time
 import csv
-import queue
 import threading
 import argparse
 from pathlib import Path
+import tempfile
+import shutil
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -28,14 +28,16 @@ from tqdm import tqdm
 parser = argparse.ArgumentParser()
 parser.add_argument("--lang_l1", type=str, default="es")
 parser.add_argument("--seq_len", type=int, default=512)
-parser.add_argument("--shard_seqs", type=int, default=50_000, help="Safer, smaller shard size")
+parser.add_argument("--shard_seqs", type=int, default=50_000, help="Number of sequences per shard")
 parser.add_argument("--tokenizer_batch", type=int, default=20_000)
+parser.add_argument("--upload_batch_size", type=int, default=10, help="Number of shards per HF upload batch")
 args = parser.parse_args()
 
 L1 = args.lang_l1
 SEQ_LEN = args.seq_len
 SHARD_SEQS = args.shard_seqs
 TOKENIZER_BATCH = args.tokenizer_batch
+UPLOAD_BATCH_SIZE = args.upload_batch_size
 TOKENS_PER_SHARD = SHARD_SEQS * SEQ_LEN
 
 HF_USER = "RA-ALTA"
@@ -80,42 +82,41 @@ def debug_print(msg):
     print(f"[Rank {LOCAL_RANK}] {msg}", flush=True)
 
 # ----------------------------------------------------
-# ASYNC UPLOAD THREAD
+# UPLOADER WITH BATCHES
 # ----------------------------------------------------
-upload_queue = queue.Queue()
+def upload_batch(folder: Path, repo_id: str, max_retries=5, base_delay=2):
+    """
+    Upload all files in `folder` to HF repo in a single batch commit.
+    Uses exponential backoff on failures.
+    """
+    files = sorted(folder.glob("*.parquet"))
+    if not files:
+        return
 
-def uploader(max_retries=5, base_delay=2):
-    """
-    Async uploader with automatic retries and exponential backoff.
-    """
-    while True:
-        item = upload_queue.get()
-        if item is None:
-            break
-        fname, repo_id = item
+    for f in files:
         retries = 0
         while retries <= max_retries:
             try:
                 api.upload_file(
-                    path_or_fileobj=str(fname),
-                    path_in_repo=fname.name,
+                    path_or_fileobj=str(f),
+                    path_in_repo=f.name,
                     repo_id=repo_id,
                     repo_type="dataset"
                 )
-                os.remove(fname)
-                debug_print(f"Uploaded {fname.name} successfully.")
-                time.sleep(1)  # small delay between uploads to avoid HF rate limits
-                break  # success, exit retry loop
+                debug_print(f"Uploaded {f.name}")
+                f.unlink()
+                time.sleep(1)  # small delay to avoid HF rate limit
+                break
             except Exception as e:
                 retries += 1
-                wait_time = base_delay * (2 ** (retries - 1))  # exponential backoff
-                debug_print(f"Upload failed ({retries}/{max_retries}) for {fname.name}: {e}")
+                wait_time = base_delay * (2 ** (retries - 1))
+                debug_print(f"Upload failed ({retries}/{max_retries}) for {f.name}: {e}")
                 if retries > max_retries:
-                    debug_print(f"Max retries exceeded for {fname.name}, skipping file.")
+                    debug_print(f"Max retries exceeded for {f.name}, skipping.")
                     break
-                debug_print(f"Retrying in {wait_time:.1f} seconds...")
+                debug_print(f"Retrying in {wait_time:.1f}s...")
                 time.sleep(wait_time)
-        upload_queue.task_done()
+
 # ----------------------------------------------------
 # LOGGING
 # ----------------------------------------------------
@@ -147,12 +148,12 @@ def get_stream(lang):
 # ----------------------------------------------------
 # SHARD WRITER
 # ----------------------------------------------------
-def write_shard(token_array, shard_id, lang, repo_id):
+def write_shard(token_array, shard_id, lang, tmp_folder):
+    fname = tmp_folder / f"{lang}_train_{shard_id:05d}_rank{LOCAL_RANK}.parquet"
     try:
         table = pa.Table.from_arrays([token_array], names=["input_ids"])
-        fname = OUT_DIR / f"{lang}_train_{shard_id:05d}_rank{LOCAL_RANK}.parquet"
         pq.write_table(table, fname, compression="zstd", row_group_size=4096)
-        upload_queue.put((fname, repo_id))
+        return fname
     except Exception as e:
         debug_print(f"Shard write failed: {e}")
         sys.exit(1)
@@ -160,27 +161,21 @@ def write_shard(token_array, shard_id, lang, repo_id):
 # ----------------------------------------------------
 # MAIN PIPELINE PER RANK
 # ----------------------------------------------------
-def run_pipeline(lang, target_tokens, tokenizer):
-    repo_name = REPO_NAMING[lang]
-    repo_id = f"{HF_USER}/{repo_name}"
-
-    # Rank 0 creates repo
-    if LOCAL_RANK == 0:
-        try:
-            create_repo(repo_id, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
-        except Exception as e:
-            debug_print(f"Repo creation failed: {e}")
-            sys.exit(1)
-
+def run_pipeline(lang, target_tokens, tokenizer, repo_id):
     debug_print(f"Starting processing {lang} → {repo_id}")
     stream = iter(get_stream(lang))
-    shard = LOCAL_RANK  # Start shard offset by rank
+    shard = LOCAL_RANK  # start shard offset by rank
     tokens_seen = 0
     flat_tokens = []
     shard_start = time.perf_counter()
 
+    tmp_folder = Path(tempfile.mkdtemp(prefix=f"rank{LOCAL_RANK}_"))
+    debug_print(f"Temporary shard folder: {tmp_folder}")
+
     pbar = tqdm(total=target_tokens, unit="tok",
                 desc=f"{lang}-R{LOCAL_RANK}", unit_scale=True, position=LOCAL_RANK)
+
+    shards_in_batch = []
 
     while tokens_seen < target_tokens:
         texts = []
@@ -211,14 +206,28 @@ def run_pipeline(lang, target_tokens, tokenizer):
             except Exception as e:
                 debug_print(f"FixedSizeListArray creation failed: {e}")
                 sys.exit(1)
-            write_shard(arr, shard, lang, repo_id)
+
+            fname = write_shard(arr, shard, lang, tmp_folder)
+            shards_in_batch.append(fname)
+
+            # Upload batch if threshold reached
+            if len(shards_in_batch) >= UPLOAD_BATCH_SIZE:
+                upload_batch(tmp_folder, repo_id)
+                shards_in_batch = []
+
             duration = time.perf_counter() - shard_start
             log_stats(lang, shard, TOKENS_PER_SHARD, duration)
             tokens_seen += TOKENS_PER_SHARD
-            shard += WORLD_SIZE  # Next shard for this rank
+            shard += WORLD_SIZE  # next shard for this rank
             pbar.update(TOKENS_PER_SHARD)
             shard_start = time.perf_counter()
 
+    # Upload any remaining shards
+    if shards_in_batch:
+        upload_batch(tmp_folder, repo_id)
+
+    # Remove temporary folder
+    shutil.rmtree(tmp_folder)
     pbar.close()
     debug_print(f"Finished {lang}")
 
@@ -233,19 +242,17 @@ def main():
         debug_print(f"Tokenizer load failed: {e}")
         sys.exit(1)
 
-    uploader_thread = threading.Thread(target=uploader)
-    uploader_thread.start()
-
     for lang, target in TARGETS.items():
-        try:
-            run_pipeline(lang, target, tokenizer)
-        except Exception as e:
-            debug_print(f"Pipeline error: {e}")
-            sys.exit(1)
+        repo_name = REPO_NAMING[lang]
+        repo_id = f"{HF_USER}/{repo_name}"
+        if LOCAL_RANK == 0:
+            try:
+                create_repo(repo_id, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
+            except Exception as e:
+                debug_print(f"Repo creation failed: {e}")
+                sys.exit(1)
 
-    # Stop uploader
-    upload_queue.put(None)
-    uploader_thread.join()
+        run_pipeline(lang, target, tokenizer, repo_id)
 
     debug_print("Dataset generation complete.")
 
