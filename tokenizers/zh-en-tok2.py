@@ -54,6 +54,7 @@ def cache_training_corpus():
 # =====================================================
 def train_and_push():
     from tokenizers import ByteLevelBPETokenizer
+    from huggingface_hub import create_repo
 
     cache_training_corpus()
 
@@ -67,7 +68,6 @@ def train_and_push():
         special_tokens=["<s>", "</s>", "<pad>", "<unk>"]
     )
 
-    # Wrap in HuggingFace Transformers tokenizer
     hf_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
         bos_token="<s>",
@@ -80,8 +80,10 @@ def train_and_push():
     hf_tokenizer.save_pretrained(OUT_DIR)
     print(f"✅ Tokenizer saved to {OUT_DIR}")
 
+    # Ensure repo exists
     if HF_TOKEN:
-        hf_tokenizer.push_to_hub(REPO_ID, token=HF_TOKEN)
+        create_repo(REPO_ID, exist_ok=True, token=HF_TOKEN)
+        hf_tokenizer.push_to_hub(REPO_ID, use_auth_token=HF_TOKEN)
         print(f"✅ Tokenizer pushed to HuggingFace Hub: {REPO_ID}")
 # =====================================================
 # 3. BENCHMARK
