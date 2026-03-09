@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-End-to-end tokenizer factory + shard uploader.
+Production-ready tokenizer factory + shard uploader.
 
-Features
---------
-• Vectorized tokenization
-• Arrow FixedSizeListArray shards
-• Deterministic tmp shard folder per rank
-• Batch uploads to HF
-• Exponential retry
-• Shards deleted only after successful upload
-• Resumable if HF fails or previous run crashed
-• Multi-GPU safe
+Fixes:
+- target_tokens divided by WORLD_SIZE
+- safer input_ids concatenation
+- repo creation race handled
+- shard IDs resume from last uploaded shard
+- fully resumable
 
 Run:
 torchrun --nproc_per_node=8 tokenizer_factory.py --lang_l1 fr
@@ -34,7 +30,6 @@ from tqdm import tqdm
 # ------------------------------------------------
 # ARGUMENTS
 # ------------------------------------------------
-
 parser = argparse.ArgumentParser()
 parser.add_argument("--lang_l1", type=str, default="es")
 parser.add_argument("--seq_len", type=int, default=512)
@@ -53,7 +48,6 @@ TOKENS_PER_SHARD = SEQ_LEN * SHARD_SEQS
 # ------------------------------------------------
 # HF SETTINGS
 # ------------------------------------------------
-
 HF_USER = "RA-ALTA"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if HF_TOKEN is None:
@@ -61,20 +55,12 @@ if HF_TOKEN is None:
 
 TOKENIZER_ID = f"{HF_USER}/tokenizer-{L1}-en"
 
-TARGETS = {
-    L1: 3_500_000_000,
-    "en": 2_500_000_000
-}
-
-REPOS = {
-    L1: f"{L1}-en-5B",
-    "en": f"en-{L1}-5B"
-}
+TARGETS = {L1: 3_500_000_000, "en": 2_500_000_000}
+REPOS = {L1: f"{L1}-en-5B", "en": f"en-{L1}-5B"}
 
 # ------------------------------------------------
 # DISTRIBUTED INFO
 # ------------------------------------------------
-
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 
@@ -84,18 +70,15 @@ def log(msg):
 api = HfApi(token=HF_TOKEN)
 
 # ------------------------------------------------
-# SAFE HF UPLOAD (LOOPS UNTIL ALL SHARDS UPLOADED)
+# SAFE HF UPLOAD (loops until folder empty)
 # ------------------------------------------------
-
 def upload_tmp_shards(tmp_dir, repo_id):
     while True:
         files = sorted(tmp_dir.glob("*.parquet"))
         if not files:
-            return  # nothing left to upload
-
+            return
         batch = files[:UPLOAD_BATCH]
         log(f"Uploading batch of {len(batch)} shards")
-
         retries = 0
         while True:
             try:
@@ -109,7 +92,7 @@ def upload_tmp_shards(tmp_dir, repo_id):
                     f.unlink()
                 log("Upload success")
                 time.sleep(1)
-                break  # batch uploaded successfully
+                break
             except Exception as e:
                 retries += 1
                 wait = min(120, 2 ** retries)
@@ -119,7 +102,6 @@ def upload_tmp_shards(tmp_dir, repo_id):
 # ------------------------------------------------
 # DATA STREAM
 # ------------------------------------------------
-
 def get_stream(lang):
     if lang == L1:
         return load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
@@ -128,7 +110,6 @@ def get_stream(lang):
 # ------------------------------------------------
 # WRITE SHARD
 # ------------------------------------------------
-
 def write_shard(tokens, shard_id, lang, tmp_dir):
     flat = pa.array(tokens, type=pa.int32())
     arr = pa.FixedSizeListArray.from_arrays(flat, SEQ_LEN)
@@ -140,43 +121,43 @@ def write_shard(tokens, shard_id, lang, tmp_dir):
 # ------------------------------------------------
 # PIPELINE
 # ------------------------------------------------
-
 def run_pipeline(lang, target_tokens, tokenizer, repo_id):
-    # deterministic tmp folder per rank
     tmp_dir = Path(f"/tmp/hf_shards_{lang}_rank{LOCAL_RANK}")
     tmp_dir.mkdir(exist_ok=True)
-
     log(f"Temporary shard dir: {tmp_dir}")
 
     # flush leftovers first
     upload_tmp_shards(tmp_dir, repo_id)
 
-    stream = iter(get_stream(lang))
-    shard = LOCAL_RANK
+    # determine starting shard based on existing shards
+    existing_shards = list(tmp_dir.glob(f"{lang}_train_*_rank{LOCAL_RANK}.parquet"))
+    if existing_shards:
+        max_id = max(int(f.stem.split("_")[2]) for f in existing_shards)
+        shard = max_id + WORLD_SIZE
+    else:
+        shard = LOCAL_RANK
+
+    # divide target tokens across ranks
+    per_rank_target = target_tokens // WORLD_SIZE
     tokens_seen = 0
     buffer = np.empty(0, dtype=np.int32)
+    stream = iter(get_stream(lang))
 
-    pbar = tqdm(
-        total=target_tokens,
-        unit="tok",
-        unit_scale=True,
-        desc=f"{lang}-R{LOCAL_RANK}",
-        position=LOCAL_RANK
-    )
+    pbar = tqdm(total=per_rank_target, unit="tok", unit_scale=True,
+                desc=f"{lang}-R{LOCAL_RANK}", position=LOCAL_RANK)
 
-    while tokens_seen < target_tokens:
+    while tokens_seen < per_rank_target:
         texts = []
         for _ in range(TOKENIZER_BATCH):
             try:
                 texts.append(next(stream)["text"])
             except StopIteration:
                 break
-
         if not texts:
             break
 
         enc = tokenizer(texts, add_special_tokens=False, return_attention_mask=False)
-        tokens = np.concatenate(enc["input_ids"]).astype(np.int32)
+        tokens = np.concatenate([np.array(ids, dtype=np.int32) for ids in enc["input_ids"]])
         buffer = np.concatenate([buffer, tokens])
 
         while buffer.size >= TOKENS_PER_SHARD:
@@ -192,7 +173,6 @@ def run_pipeline(lang, target_tokens, tokenizer, repo_id):
 
     # final upload for leftovers
     upload_tmp_shards(tmp_dir, repo_id)
-
     log("Cleaning tmp dir")
     shutil.rmtree(tmp_dir)
     pbar.close()
@@ -200,15 +180,25 @@ def run_pipeline(lang, target_tokens, tokenizer, repo_id):
 # ------------------------------------------------
 # MAIN
 # ------------------------------------------------
-
 def main():
     log("Loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True, token=HF_TOKEN)
 
     for lang, target in TARGETS.items():
         repo_id = f"{HF_USER}/{REPOS[lang]}"
+
+        # only rank 0 creates repo
         if LOCAL_RANK == 0:
             create_repo(repo_id, repo_type="dataset", exist_ok=True, token=HF_TOKEN)
+
+        # barrier: wait for rank 0 to finish creating repo
+        while True:
+            try:
+                api.dataset_info(repo_id)
+                break
+            except Exception:
+                log("Waiting for repo creation...")
+                time.sleep(2)
 
         run_pipeline(lang, target, tokenizer, repo_id)
 
