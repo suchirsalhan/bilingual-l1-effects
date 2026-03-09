@@ -46,7 +46,7 @@ if HF_TOKEN is None:
 TOKENIZER_ID = f"{HF_USER}/tokenizer-{L1}-en"
 
 TARGETS = {
-    L1: 3_500_000_000,
+    L1: 4_000_000_000,
     "en": 2_000_000_000
 }
 
