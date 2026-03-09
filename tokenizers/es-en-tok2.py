@@ -62,7 +62,13 @@ def train_and_push():
         min_frequency=2,
         special_tokens=["<s>", "</s>", "<pad>", "<unk>"]
     )
-
+    # Sanity check: make sure spaces are preserved in pre-tokenization
+    sample = next(get_training_corpus())
+    pre_tok_sample = tokenizer.pre_tokenizer.pre_tokenize_str(sample)
+    print("Sample raw text:   ", repr(sample[:100]))
+    print("Pre-tokenized:     ", pre_tok_sample[:50])
+    print("Spaces in raw text:", sample.count(" "))
+    
     tokenizer.train_from_iterator(get_training_corpus(), trainer=trainer)
     
     # Wrap in Transformers-compatible class
