@@ -47,7 +47,7 @@ TOKENIZER_ID = f"{HF_USER}/tokenizer-{L1}-en"
 
 TARGETS = {
     L1: 4_000_000_000,
-    "en": 2_000_000_000
+    "en": 2_500_000_000
 }
 
 REPO_NAMING = {
