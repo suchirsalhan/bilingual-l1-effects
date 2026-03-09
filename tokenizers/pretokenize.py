@@ -55,7 +55,7 @@ if HF_TOKEN is None:
 
 TOKENIZER_ID = f"{HF_USER}/tokenizer-{L1}-en"
 
-TARGETS = {L1: 3_500_000_000, "en": 2_500_000_000}
+TARGETS = {L1: 4_000_000_000, "en": 2_500_000_000}
 REPOS = {L1: f"{L1}-en-5B", "en": f"en-{L1}-5B"}
 
 # ------------------------------------------------
