@@ -64,9 +64,7 @@ def train_and_push():
         files=[str(CORPUS_FILE)],
         vocab_size=VOCAB_SIZE,
         min_frequency=2,
-        special_tokens=["<s>", "</s>", "<pad>", "<unk>"],
-        threads=os.cpu_count(),  # automatically use all available CPU cores
-        show_progress=True
+        special_tokens=["<s>", "</s>", "<pad>", "<unk>"]
     )
 
     # Wrap in HuggingFace Transformers tokenizer
@@ -85,7 +83,6 @@ def train_and_push():
     if HF_TOKEN:
         hf_tokenizer.push_to_hub(REPO_ID, token=HF_TOKEN)
         print(f"✅ Tokenizer pushed to HuggingFace Hub: {REPO_ID}")
-
 # =====================================================
 # 3. BENCHMARK
 # =====================================================
