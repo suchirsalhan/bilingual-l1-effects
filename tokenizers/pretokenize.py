@@ -84,24 +84,38 @@ def debug_print(msg):
 # ----------------------------------------------------
 upload_queue = queue.Queue()
 
-def uploader():
+def uploader(max_retries=5, base_delay=2):
+    """
+    Async uploader with automatic retries and exponential backoff.
+    """
     while True:
         item = upload_queue.get()
         if item is None:
             break
         fname, repo_id = item
-        try:
-            api.upload_file(
-                path_or_fileobj=str(fname),
-                path_in_repo=fname.name,
-                repo_id=repo_id,
-                repo_type="dataset"
-            )
-            os.remove(fname)
-        except Exception as e:
-            debug_print(f"Upload failed: {e}")
+        retries = 0
+        while retries <= max_retries:
+            try:
+                api.upload_file(
+                    path_or_fileobj=str(fname),
+                    path_in_repo=fname.name,
+                    repo_id=repo_id,
+                    repo_type="dataset"
+                )
+                os.remove(fname)
+                debug_print(f"Uploaded {fname.name} successfully.")
+                time.sleep(1)  # small delay between uploads to avoid HF rate limits
+                break  # success, exit retry loop
+            except Exception as e:
+                retries += 1
+                wait_time = base_delay * (2 ** (retries - 1))  # exponential backoff
+                debug_print(f"Upload failed ({retries}/{max_retries}) for {fname.name}: {e}")
+                if retries > max_retries:
+                    debug_print(f"Max retries exceeded for {fname.name}, skipping file.")
+                    break
+                debug_print(f"Retrying in {wait_time:.1f} seconds...")
+                time.sleep(wait_time)
         upload_queue.task_done()
-
 # ----------------------------------------------------
 # LOGGING
 # ----------------------------------------------------
