@@ -2,12 +2,21 @@
 """Instruction tuning script — SSH/GPU ready, no local saving"""
 
 import os
-os.environ["HF_HOME"] = "/local/scratch/lgb35/hf_cache"
-os.environ["HUGGINGFACE_HUB_TOKEN"] = "TUQhUgrNyKvaGtoMHbzKIGjvwApbaLQfJc"
-
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForSeq2Seq
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForSeq2Seq
+)
+
+# -----------------------------
+# ENVIRONMENT (HF token + cache)
+# -----------------------------
+os.environ["HF_HOME"] = "/local/scratch/lgb35/hf_cache"
+os.environ["HUGGINGFACE_HUB_TOKEN"] = "TUQhUgrNyKvaGtoMHbzKIGjvwApbaLQfJc"
 
 # -----------------------------
 # CONFIG
@@ -18,27 +27,19 @@ IGNORE_INDEX = -100
 HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"
 
 # -----------------------------
-# TOKENIZER + MODEL (pass token explicitly!)
+# TOKENIZER + MODEL
 # -----------------------------
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-# Use HF token and local cache
-HF_TOKEN = os.environ["HUGGINGFACE_HUB_TOKEN"]
-
-# Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME,
-    use_auth_token=HF_TOKEN
+    MODEL_NAME
 )
 
 # Add pad token if missing
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# Model
+# Load model (no use_auth_token here!)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    use_auth_token=HF_TOKEN,
     trust_remote_code=True  # keep True if model has custom code
 )
 
@@ -57,9 +58,7 @@ alpaca_english = load_dataset("tatsu-lab/alpaca", split="train")
 
 # Keep only empty input and non-empty output
 alpaca_english = alpaca_english.filter(lambda e: e['input'] == "")
-alpaca_english = alpaca_english.filter(
-    lambda e: e.get("output") and e["output"].strip() != ""
-)
+alpaca_english = alpaca_english.filter(lambda e: e.get("output") and e["output"].strip() != "")
 
 # Rename columns
 alpaca_english = alpaca_english.rename_columns({
@@ -77,7 +76,6 @@ def format_example(example):
     prompt = f"### Instruction:\n{example['instruction']}\n\n### Response:\n"
     answer = example["response"]
 
-    # Tokenize prompt
     prompt_tokens = tokenizer(prompt, add_special_tokens=False)
     prompt_len = len(prompt_tokens["input_ids"])
 
@@ -85,11 +83,13 @@ def format_example(example):
     if max_response_len <= 0:
         raise ValueError("Prompt too long for MAX_LENGTH")
 
-    # Tokenize answer (truncate if necessary)
-    answer_tokens = tokenizer(answer, add_special_tokens=False,
-                              truncation=True, max_length=max_response_len)
+    answer_tokens = tokenizer(
+        answer,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_response_len
+    )
 
-    # Combine
     input_ids = prompt_tokens["input_ids"] + answer_tokens["input_ids"] + [tokenizer.eos_token_id]
     attention_mask = [1] * len(input_ids)
     labels = input_ids.copy()
@@ -103,10 +103,12 @@ dataset = dataset.map(format_example, remove_columns=dataset.column_names)
 # SAFETY CHECK
 # -----------------------------
 vocab_size = model.get_input_embeddings().weight.shape[0]
+
 def validate(example):
     for t in example["input_ids"]:
         assert 0 <= t < vocab_size, f"Token id {t} outside vocab"
     return example
+
 dataset = dataset.map(validate)
 
 # -----------------------------
@@ -118,14 +120,14 @@ collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True)
 # TRAINING ARGS (no local saving)
 # -----------------------------
 training_args = TrainingArguments(
-    output_dir="./dummy_output",  # required but not saving
+    output_dir="./dummy_output",
     per_device_train_batch_size=4,
     gradient_accumulation_steps=2,
     learning_rate=5e-5,
     num_train_epochs=1,
     logging_strategy="steps",
     logging_steps=200,
-    save_strategy="no",  # disable local checkpoint saving
+    save_strategy="no",
     bf16=torch.cuda.is_available(),
     report_to="none",
     disable_tqdm=False
@@ -147,6 +149,6 @@ trainer.train()
 # PUSH TO HUGGING FACE HUB
 # -----------------------------
 print("Pushing model and tokenizer to Hugging Face Hub...")
-model.push_to_hub(HF_REPO, use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"])
-tokenizer.push_to_hub(HF_REPO, use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"])
+model.push_to_hub(HF_REPO)
+tokenizer.push_to_hub(HF_REPO)
 print("Training and push complete!")
