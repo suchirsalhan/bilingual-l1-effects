@@ -2,6 +2,9 @@
 """Instruction tuning script — SSH/GPU ready, no local saving"""
 
 import os
+os.environ["HF_HOME"] = "/local/scratch/lgb35/hf_cache"
+os.environ["HUGGINGFACE_HUB_TOKEN"] = "TUQhUgrNyKvaGtoMHbzKIGjvwApbaLQfJc"
+
 import torch
 from datasets import load_dataset
 from transformers import (
@@ -138,6 +141,6 @@ trainer.train()
 # PUSH TO HUGGING FACE HUB
 # -----------------------------
 print("Pushing model and tokenizer to Hugging Face Hub...")
-model.push_to_hub(HF_REPO)
-tokenizer.push_to_hub(HF_REPO)
+model.push_to_hub(HF_REPO, use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"])
+tokenizer.push_to_hub(HF_REPO, use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"])
 print("Training and push complete!")
