@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+"""Instruction tuning script — SSH/GPU ready, no local saving"""
+
+import os
 import torch
 from datasets import load_dataset
 from transformers import (
@@ -11,20 +15,31 @@ from transformers import (
 # -----------------------------
 # CONFIG
 # -----------------------------
-MODEL_NAME = "RA-ALTA/tr-en-intermediate"          # base model
+MODEL_NAME = "RA-ALTA/tr-en-intermediate"  # base model
 MAX_LENGTH = 512
 IGNORE_INDEX = -100
-HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"  # HF repo to push to
+
+# Hugging Face repo to push to
+HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"
 
 # -----------------------------
-# LOAD TOKENIZER + MODEL
+# TOKENIZER + MODEL
 # -----------------------------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-tokenizer.padding_side = "right"
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_NAME,
+    use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN")
+)
+
+# Add pad token if missing
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN")
+)
+
+# Resize embeddings if tokenizer changed
 model.resize_token_embeddings(len(tokenizer))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,30 +47,33 @@ model.to(device)
 print("Loaded model on:", device)
 
 # -----------------------------
-# LOAD AND PROCESS DATASET
+# DATASET
 # -----------------------------
 alpaca_english = load_dataset("tatsu-lab/alpaca", split="train")
 
-# Keep only rows with empty input
-alpaca_english = alpaca_english.filter(lambda e: e["input"] == "")
-# Remove rows with empty output
+# Keep only empty input and non-empty output
+alpaca_english = alpaca_english.filter(lambda e: e['input'] == "")
 alpaca_english = alpaca_english.filter(
-    lambda e: e.get("output") and isinstance(e["output"], str) and e["output"].strip() != ""
+    lambda e: e.get("output") and e["output"].strip() != ""
 )
+
 # Rename columns
 alpaca_english = alpaca_english.rename_columns({
     "instruction": "instruction",
-    "output": "response",
+    "output": "response"
 })
-alpaca_english = alpaca_english.shuffle(seed=42)
 
-dataset = alpaca_english
+# Shuffle dataset
+dataset = alpaca_english.shuffle(seed=42)
 
-# Tokenize and mask prompt tokens
+# -----------------------------
+# FORMAT FUNCTION
+# -----------------------------
 def format_example(example):
     prompt = f"### Instruction:\n{example['instruction']}\n\n### Response:\n"
     answer = example["response"]
 
+    # Tokenize prompt
     prompt_tokens = tokenizer(prompt, add_special_tokens=False)
     prompt_len = len(prompt_tokens["input_ids"])
 
@@ -63,18 +81,23 @@ def format_example(example):
     if max_response_len <= 0:
         raise ValueError("Prompt too long for MAX_LENGTH")
 
-    answer_tokens = tokenizer(answer, add_special_tokens=False, truncation=True, max_length=max_response_len)
+    # Tokenize answer (truncate if necessary)
+    answer_tokens = tokenizer(answer, add_special_tokens=False,
+                              truncation=True, max_length=max_response_len)
 
+    # Combine
     input_ids = prompt_tokens["input_ids"] + answer_tokens["input_ids"] + [tokenizer.eos_token_id]
     attention_mask = [1] * len(input_ids)
     labels = input_ids.copy()
-    labels[:prompt_len] = [IGNORE_INDEX] * prompt_len
+    labels[:prompt_len] = [IGNORE_INDEX] * prompt_len  # mask prompt
 
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 dataset = dataset.map(format_example, remove_columns=dataset.column_names)
 
-# Safety check: ensure tokens are within vocab
+# -----------------------------
+# SAFETY CHECK
+# -----------------------------
 vocab_size = model.get_input_embeddings().weight.shape[0]
 def validate(example):
     for t in example["input_ids"]:
@@ -88,30 +111,27 @@ dataset = dataset.map(validate)
 collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True)
 
 # -----------------------------
-# TRAINING ARGS
+# TRAINING ARGS (no local saving)
 # -----------------------------
 training_args = TrainingArguments(
-    output_dir="./dummy_output",  # required but we won’t save locally
+    output_dir="./dummy_output",  # required but not saving
     per_device_train_batch_size=4,
     gradient_accumulation_steps=2,
     learning_rate=5e-5,
     num_train_epochs=1,
     logging_strategy="steps",
     logging_steps=200,
-    save_strategy="no",          # disable local saving
+    save_strategy="no",  # disable local checkpoint saving
     bf16=torch.cuda.is_available(),
     report_to="none",
     disable_tqdm=False
 )
 
-# -----------------------------
-# TRAINER
-# -----------------------------
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    data_collator=collator,
+    data_collator=collator
 )
 
 # -----------------------------
@@ -122,7 +142,8 @@ trainer.train()
 # -----------------------------
 # PUSH TO HUGGING FACE HUB
 # -----------------------------
-model.push_to_hub(HF_REPO, use_auth_token=True, max_shard_size="10GB")
-tokenizer.push_to_hub(HF_REPO, use_auth_token=True)
+print("Pushing model and tokenizer to Hugging Face Hub...")
+model.push_to_hub(HF_REPO, use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+tokenizer.push_to_hub(HF_REPO, use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
 
-print(f"Model and tokenizer successfully pushed to https://huggingface.co/{HF_REPO}")
+print("Training and push complete!")
