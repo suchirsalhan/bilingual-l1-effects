@@ -11,183 +11,97 @@ from transformers import (
 # -----------------------------
 # CONFIG
 # -----------------------------
-MODEL_NAME = "RA-ALTA/tr-en-intermediate"          # change to your model
+MODEL_NAME = "RA-ALTA/tr-en-intermediate"          # base model
 MAX_LENGTH = 512
-OUTPUT_DIR = "./inst_tuned_model"
 IGNORE_INDEX = -100
+HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"  # HF repo to push to
 
 # -----------------------------
 # LOAD TOKENIZER + MODEL
 # -----------------------------
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
 tokenizer.padding_side = "right"
-
-# GPT2 has no pad token
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-
-# Resize embeddings if tokenizer changed
 model.resize_token_embeddings(len(tokenizer))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
-
 print("Loaded model on:", device)
 
 # -----------------------------
-# LOAD DATASET
-# Expected fields:
-#   instruction
-#   response
+# LOAD AND PROCESS DATASET
 # -----------------------------
-from datasets import load_dataset, concatenate_datasets
-
 alpaca_english = load_dataset("tatsu-lab/alpaca", split="train")
 
-print(alpaca_english.column_names)
-
-print(len(alpaca_english))
-
-# remove the rows with input:
-# Keep only rows where input is empty
-alpaca_english = alpaca_english.filter(lambda example: example['input'] == "")
-# Check
-print(len(alpaca_english))
-print(alpaca_english.column_names)
-
-# remove rows with empty output
+# Keep only rows with empty input
+alpaca_english = alpaca_english.filter(lambda e: e["input"] == "")
+# Remove rows with empty output
 alpaca_english = alpaca_english.filter(
-    lambda example: (
-        example.get("output") is not None
-        and isinstance(example["output"], str)
-        and example["output"].strip() != ""
-    )
+    lambda e: e.get("output") and isinstance(e["output"], str) and e["output"].strip() != ""
 )
-# Check
-print(len(alpaca_english))
-print(alpaca_english.column_names)
-
-# rename dataset columns:
+# Rename columns
 alpaca_english = alpaca_english.rename_columns({
     "instruction": "instruction",
     "output": "response",
 })
-
-# shuffle each
 alpaca_english = alpaca_english.shuffle(seed=42)
 
 dataset = alpaca_english
 
-print(len(dataset))
-
-dataset_raw = dataset
-
-# RUN THIS ONE!
+# Tokenize and mask prompt tokens
 def format_example(example):
     prompt = f"### Instruction:\n{example['instruction']}\n\n### Response:\n"
     answer = example["response"]
 
-    # Tokenize prompt (never truncate)
-    prompt_tokens = tokenizer(
-        prompt,
-        add_special_tokens=False
-    )
+    prompt_tokens = tokenizer(prompt, add_special_tokens=False)
     prompt_len = len(prompt_tokens["input_ids"])
 
-    # Compute available space for answer
-    max_response_len = MAX_LENGTH - prompt_len - 1  # EOS
-
+    max_response_len = MAX_LENGTH - prompt_len - 1
     if max_response_len <= 0:
         raise ValueError("Prompt too long for MAX_LENGTH")
 
-    # Tokenize answer (truncate ONLY here)
-    answer_tokens = tokenizer(
-        answer,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=max_response_len
-    )
+    answer_tokens = tokenizer(answer, add_special_tokens=False, truncation=True, max_length=max_response_len)
 
-    # Concatenate
-    input_ids = (
-        prompt_tokens["input_ids"]
-        + answer_tokens["input_ids"]
-        + [tokenizer.eos_token_id]
-    )
-
+    input_ids = prompt_tokens["input_ids"] + answer_tokens["input_ids"] + [tokenizer.eos_token_id]
     attention_mask = [1] * len(input_ids)
-
-    # Labels: mask prompt tokens
     labels = input_ids.copy()
     labels[:prompt_len] = [IGNORE_INDEX] * prompt_len
 
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-    }
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-dataset = dataset.map(
-    format_example,
-    remove_columns=dataset.column_names
-)
+dataset = dataset.map(format_example, remove_columns=dataset.column_names)
 
-print(dataset.column_names)
-
-# CHECK!
-ex = dataset[0]
-print(tokenizer.decode(ex["input_ids"], skip_special_tokens=False))
-
-print(repr(dataset_raw[0]["response"]))
-
-sum(1 for x in dataset_raw if x["response"].strip() == "")
-
-print(dataset_raw.column_names)
-print(dataset_raw[0])
-
-for x in dataset_raw:
-    if x["text"] is not None:
-        print(x["text"])
-        break
-
-# -----------------------------
-# SAFETY CHECK (prevents CUDA assert)
-# -----------------------------
+# Safety check: ensure tokens are within vocab
 vocab_size = model.get_input_embeddings().weight.shape[0]
-
 def validate(example):
     for t in example["input_ids"]:
         assert 0 <= t < vocab_size, f"Token id {t} outside vocab"
     return example
-
 dataset = dataset.map(validate)
 
 # -----------------------------
 # DATA COLLATOR
 # -----------------------------
-collator = DataCollatorForSeq2Seq(
-    tokenizer=tokenizer,
-    padding=True,
-)
+collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True)
 
 # -----------------------------
 # TRAINING ARGS
 # -----------------------------
 training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
+    output_dir="./dummy_output",  # required but we won’t save locally
     per_device_train_batch_size=4,
     gradient_accumulation_steps=2,
     learning_rate=5e-5,
     num_train_epochs=1,
     logging_strategy="steps",
-    logging_steps=200,  # log more frequently
-    save_steps=500,
+    logging_steps=200,
+    save_strategy="no",          # disable local saving
     bf16=torch.cuda.is_available(),
     report_to="none",
-    disable_tqdm=False,
+    disable_tqdm=False
 )
 
 # -----------------------------
@@ -206,18 +120,9 @@ trainer = Trainer(
 trainer.train()
 
 # -----------------------------
-# SAVE MODEL
+# PUSH TO HUGGING FACE HUB
 # -----------------------------
-trainer.save_model(OUTPUT_DIR)
-tokenizer.save_pretrained(OUTPUT_DIR)
+model.push_to_hub(HF_REPO, use_auth_token=True, max_shard_size="10GB")
+tokenizer.push_to_hub(HF_REPO, use_auth_token=True)
 
-print("Training complete.")
-
-model.push_to_hub(
-    repo_id="RA-ALTA/tr-en-intermediate-alpace-english",
-    use_auth_token=True
-)
-tokenizer.push_to_hub(
-    repo_id="RA-ALTA/tr-en-intermediate-alpace-english",
-    use_auth_token=True
-)
+print(f"Model and tokenizer successfully pushed to https://huggingface.co/{HF_REPO}")
