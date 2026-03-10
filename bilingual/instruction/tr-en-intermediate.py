@@ -7,13 +7,7 @@ os.environ["HUGGINGFACE_HUB_TOKEN"] = "TUQhUgrNyKvaGtoMHbzKIGjvwApbaLQfJc"
 
 import torch
 from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForSeq2Seq
-)
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForSeq2Seq
 
 # -----------------------------
 # CONFIG
@@ -21,23 +15,24 @@ from transformers import (
 MODEL_NAME = "RA-ALTA/tr-en-intermediate"  # base model
 MAX_LENGTH = 512
 IGNORE_INDEX = -100
-
-# Hugging Face repo to push to
 HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"
 
 # -----------------------------
-# TOKENIZER + MODEL
+# TOKENIZER + MODEL (pass token explicitly!)
 # -----------------------------
 tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME)
+    MODEL_NAME,
+    use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"]  # ✅ ensures authenticated download
+)
 
-# Add pad token if missing
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"]  # ✅ ensures authenticated download
+)
 
-# Resize embeddings if tokenizer changed
 model.resize_token_embeddings(len(tokenizer))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
