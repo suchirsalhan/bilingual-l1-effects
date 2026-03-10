@@ -26,18 +26,13 @@ HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"
 # TOKENIZER + MODEL
 # -----------------------------
 tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME,
-    use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN")
-)
+    MODEL_NAME)
 
 # Add pad token if missing
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN")
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
 
 # Resize embeddings if tokenizer changed
 model.resize_token_embeddings(len(tokenizer))
@@ -143,7 +138,6 @@ trainer.train()
 # PUSH TO HUGGING FACE HUB
 # -----------------------------
 print("Pushing model and tokenizer to Hugging Face Hub...")
-model.push_to_hub(HF_REPO, use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-tokenizer.push_to_hub(HF_REPO, use_auth_token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-
+model.push_to_hub(HF_REPO)
+tokenizer.push_to_hub(HF_REPO)
 print("Training and push complete!")
