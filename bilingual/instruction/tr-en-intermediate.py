@@ -20,21 +20,32 @@ HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"
 # -----------------------------
 # TOKENIZER + MODEL (pass token explicitly!)
 # -----------------------------
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Use HF token and local cache
+HF_TOKEN = os.environ["HUGGINGFACE_HUB_TOKEN"]
+
+# Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_NAME,
-    use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"]  # ✅ ensures authenticated download
+    use_auth_token=HF_TOKEN
 )
 
+# Add pad token if missing
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
+# Model
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    use_auth_token=os.environ["HUGGINGFACE_HUB_TOKEN"]  # ✅ ensures authenticated download
+    use_auth_token=HF_TOKEN,
+    trust_remote_code=True  # keep True if model has custom code
 )
 
+# Resize embeddings if tokenizer changed
 model.resize_token_embeddings(len(tokenizer))
 
+# Move to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 print("Loaded model on:", device)
