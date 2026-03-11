@@ -32,15 +32,12 @@ LOCAL_DIR = "./dummy_output"  # local save directory
 # -----------------------------
 # TOKENIZER + MODEL
 # -----------------------------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_auth_token=HF_TOKEN)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    trust_remote_code=True
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
 
 model.resize_token_embeddings(len(tokenizer))
 
