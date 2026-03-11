@@ -115,6 +115,13 @@ alpaca_german = alpaca_german.filter(
 print(len(alpaca_german))
 print(alpaca_german.column_names)
 
+print("Before filter:", len(alpaca_german))
+alpaca_german = alpaca_german.filter(
+    lambda e: len(tokenizer(e["instruction"])["input_ids"] + 
+                 tokenizer(e["output"])["input_ids"]) < MAX_LENGTH
+)
+print("After filter:", len(alpaca_german))
+
 # rename dataset columns:
 alpaca_english = alpaca_english.rename_columns({
     "instruction": "instruction",
