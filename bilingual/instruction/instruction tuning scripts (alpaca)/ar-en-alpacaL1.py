@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""Laura instruction tuning alpaca English + Arabic (31322 rows total)
-
-# -*- coding: utf-8 -*-
-"""Instruction tuning script — SSH/GPU ready, safe local saving + HF push"""
-
 import os
 import torch
 from datasets import load_dataset
@@ -212,15 +206,8 @@ print(tokenizer.decode(ex["input_ids"], skip_special_tokens=False))
 
 print(repr(dataset_raw[0]["response"]))
 
-sum(1 for x in dataset_raw if x["response"].strip() == "")
-
 print(dataset_raw.column_names)
 print(dataset_raw[0])
-
-for x in dataset_raw:
-    if x["text"] is not None:
-        print(x["text"])
-        break
 
 # -----------------------------
 # SAFETY CHECK (prevents CUDA assert)
@@ -247,17 +234,18 @@ collator = DataCollatorForSeq2Seq(
 # -----------------------------
 
 training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
+    output_dir=LOCAL_DIR,
     per_device_train_batch_size=16,
     gradient_accumulation_steps=1,
-    learning_rate=5e-5,
     num_train_epochs=1,
+    learning_rate=5e-5,
+    bf16=True,
     logging_strategy="steps",
-    logging_steps=200,  # log more frequently
-    save_steps=500,
-    bf16=torch.cuda.is_available(),
+    logging_steps=200,
+    save_strategy="epoch",      # save at end of epoch
+    dataloader_num_workers=8,
     report_to="none",
-    disable_tqdm=False,
+    disable_tqdm=False
 )
 
 # -----------------------------
