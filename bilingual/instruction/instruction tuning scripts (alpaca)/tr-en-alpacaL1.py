@@ -20,10 +20,10 @@ if HF_TOKEN is None:
 # -----------------------------
 # CONFIG
 # -----------------------------
-MODEL_NAME = "RA-ALTA/tr-en-intermediate"
+MODEL_NAME = "RA-ALTA/tr-en-advanced"
 MAX_LENGTH = 512
 IGNORE_INDEX = -100
-HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english-L1"
+HF_REPO = "RA-ALTA/tr-en-advanced-alpaca-english-L1"
 LOCAL_DIR = "./dummy_output"  # local save directory
 
 # -----------------------------
