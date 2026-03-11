@@ -16,17 +16,16 @@ from transformers import (
 # ENVIRONMENT (HF token + cache)
 # -----------------------------
 os.environ["HF_HOME"] = "/local/scratch/lgb35/hf_cache"
-os.environ["HUGGINGFACE_HUB_TOKEN"] = "TUQhUgrNyKvaGtoMHbzKIGjvwApbaLQfJc"
-HF_TOKEN = os.environ["HUGGINGFACE_HUB_TOKEN"]
+HF_TOKEN = os.environ.get("HF_TOKEN")  # Ensure you exported this in SSH
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-MODEL_NAME = "RA-ALTA/tr-en-intermediate"  # base model
+MODEL_NAME = "RA-ALTA/tr-en-intermediate"
 MAX_LENGTH = 512
 IGNORE_INDEX = -100
 HF_REPO = "RA-ALTA/tr-en-intermediate-alpaca-english"
-LOCAL_DIR = "./dummy_output"  # local save directory
+LOCAL_DIR = "./dummy_output"
 
 # -----------------------------
 # TOKENIZER + MODEL
@@ -40,7 +39,6 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     trust_remote_code=True
 )
-
 model.resize_token_embeddings(len(tokenizer))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,10 +87,12 @@ dataset = dataset.map(format_example, remove_columns=dataset.column_names)
 # SAFETY CHECK
 # -----------------------------
 vocab_size = model.get_input_embeddings().weight.shape[0]
+
 def validate(example):
     for t in example["input_ids"]:
         assert 0 <= t < vocab_size, f"Token id {t} outside vocab"
     return example
+
 dataset = dataset.map(validate)
 
 # -----------------------------
@@ -104,7 +104,7 @@ collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True)
 # TRAINING ARGS
 # -----------------------------
 training_args = TrainingArguments(
-    output_dir=LOCAL_DIR,       # save locally
+    output_dir=LOCAL_DIR,
     per_device_train_batch_size=8,
     gradient_accumulation_steps=2,
     num_train_epochs=1,
@@ -112,7 +112,7 @@ training_args = TrainingArguments(
     bf16=True,
     logging_strategy="steps",
     logging_steps=200,
-    save_strategy="epoch",       # save at end of epoch
+    save_strategy="epoch",      # save at end of epoch
     dataloader_num_workers=8,
     report_to="none",
     disable_tqdm=False
