@@ -20,10 +20,10 @@ if HF_TOKEN is None:
 # -----------------------------
 # CONFIG
 # -----------------------------
-MODEL_NAME = "RA-ALTA/ar-en-advanced"
+MODEL_NAME = "RA-ALTA/es-en-beginner"
 MAX_LENGTH = 512
 IGNORE_INDEX = -100
-HF_REPO = "RA-ALTA/ar-en-advanced-alpaca-english-L1"
+HF_REPO = "RA-ALTA/es-en-beginner-alpaca-english-L1"
 LOCAL_DIR = "./dummy_output"  # local save directory
 
 # -----------------------------
@@ -41,22 +41,22 @@ model.resize_token_embeddings(len(tokenizer))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 print("Loaded model on:", device)
+
+
 # -----------------------------
-# LOAD DATASET
-# Expected fields:
-#   instruction
-#   response
+# DATASET
 # -----------------------------
+
 from datasets import load_dataset, concatenate_datasets
 
 alpaca_english = load_dataset("tatsu-lab/alpaca", split="train")
-alpaca_arabic = load_dataset("saillab/alpaca-arabic-cleaned", split="train")
+alpaca_spanish = load_dataset("bertin-project/alpaca-spanish", split="train")
 
 print(alpaca_english.column_names)
-print(alpaca_arabic.column_names)
+print(alpaca_spanish.column_names)
 
 print(len(alpaca_english))
-print(len(alpaca_arabic))
+print(len(alpaca_spanish))
 
 # remove the rows with input:
 # Keep only rows where input is empty
@@ -86,21 +86,21 @@ def normalize_example(example):
             example[col] = unicodedata.normalize("NFKC", example[col])
     return example
 
-alpaca_arabic = alpaca_arabic.map(normalize_example)
+alpaca_spanish = alpaca_spanish.map(normalize_example)
 
 # remove the rows with input:
 # Keep only rows where input is empty
-alpaca_arabic = alpaca_arabic.filter(
+alpaca_spanish = alpaca_spanish.filter(
     lambda example: example.get("input") is None
                     or example["input"].strip() == ""
                     or example["input"].strip() == "nan"
 )
 # Check
-print(len(alpaca_arabic))
-print(alpaca_arabic.column_names)
+print(len(alpaca_spanish))
+print(alpaca_spanish.column_names)
 
 # many rows have empty output:
-alpaca_arabic = alpaca_arabic.filter(
+alpaca_spanish = alpaca_spanish.filter(
     lambda example: (
         example.get("output") is not None
         and isinstance(example["output"], str)
@@ -108,8 +108,8 @@ alpaca_arabic = alpaca_arabic.filter(
     )
 )
 # Check
-print(len(alpaca_arabic))
-print(alpaca_arabic.column_names)
+print(len(alpaca_spanish))
+print(alpaca_spanish.column_names)
 
 # rename dataset columns:
 alpaca_english = alpaca_english.rename_columns({
@@ -118,16 +118,16 @@ alpaca_english = alpaca_english.rename_columns({
 })
 
 # rename dataset columns:
-alpaca_arabic = alpaca_arabic.rename_columns({
+alpaca_spanish = alpaca_spanish.rename_columns({
     "instruction": "instruction",
     "output": "response",
 })
 
 # shuffle each
 alpaca_english = alpaca_english.shuffle(seed=42)
-alpaca_arabic = alpaca_arabic.shuffle(seed=42)
+alpaca_spanish = alpaca_spanish.shuffle(seed=42)
 
-min_size = min(len(alpaca_english), len(alpaca_arabic))
+min_size = min(len(alpaca_english), len(alpaca_spanish))
 print(min_size)
 
 target_per_dataset = 31322 // 2
@@ -136,12 +136,19 @@ print(target_per_dataset)
 target_size = target_per_dataset
 
 alpaca_english_small = alpaca_english.select(range(target_size))
-alpaca_arabic_small = alpaca_arabic.select(range(target_size))
+alpaca_spanish_small = alpaca_spanish.select(range(target_size))
 
 print(len(alpaca_english_small))
-print(len(alpaca_arabic_small))
+print(len(alpaca_spanish_small))
 
-dataset = concatenate_datasets([alpaca_english_small, alpaca_arabic_small])
+# randomly halve each
+#half_en = len(alpaca_english) // 2
+#half_pl = len(alpaca_polish) // 2
+
+#alpaca_english = alpaca_english.select(range(half_en))
+#alpaca_polish = alpaca_polish.select(range(half_pl))
+
+dataset = concatenate_datasets([alpaca_english_small, alpaca_spanish_small])
 dataset = dataset.shuffle(seed=42)
 
 print(len(dataset))
@@ -206,8 +213,16 @@ print(tokenizer.decode(ex["input_ids"], skip_special_tokens=False))
 
 print(repr(dataset_raw[0]["response"]))
 
+sum(1 for x in dataset_raw if x["response"].strip() == "")
+
 print(dataset_raw.column_names)
 print(dataset_raw[0])
+
+for x in dataset_raw:
+    if x["text"] is not None:
+        print(x["text"])
+        break
+
 
 # -----------------------------
 # SAFETY CHECK (prevents CUDA assert)
