@@ -33,6 +33,9 @@ python ./pretraining/es-pretokenize.py
 python ./pretraining/laura_train.py
 ```
 # Instruction tuning
+1. Ensure that you have been granted access to datasets.
+
+2. Model instruction tuning:
 ```
 python./instruction_tuning/instruction_tuning_learner_english.py
 ```
