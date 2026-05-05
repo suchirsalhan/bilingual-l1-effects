@@ -34,5 +34,5 @@ python ./pretraining/laura_train.py
 ```
 # Instruction tuning
 ```
-python./instruction_tuning/....py
+python./instruction_tuning/instruction_tuning_learner_english.py
 ```
