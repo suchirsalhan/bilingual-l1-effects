@@ -1,5 +1,5 @@
 # L2LM L1 effects
-ACL Comp Dev Ling 2026 Submission 
+ACL CDL 2026 Submission 
 
 
 # Installation
