@@ -33,4 +33,6 @@ python ./pretraining/es-pretokenize.py
 python ./pretraining/laura_train.py
 ```
 # Instruction tuning
-Dataset access. 
+```
+python./instruction_tuning/....py
+```
