@@ -20,15 +20,15 @@ hf auth login
 ```
 # Pretraining instructions
 
-1. train the tokenizer:
+1. Train the tokenizer:
 ```
 python ./pretraining/tokenizers/es-en-tok2.py
 ```
-2. pretokenize the data:
+2. Pretokenize the data:
 ```
 python ./pretraining/es-pretokenize.py
 ```
-3. model pretraining:
+3. Model pretraining:
 ```
 python ./pretraining/laura_train.py
 ```
