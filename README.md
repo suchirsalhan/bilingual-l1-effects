@@ -18,7 +18,7 @@ pip install -r requirements.txt
 ```
 hf auth login
 ```
-4. Pretraining instructions: 
+# Pretraining instructions
 
 1. train the tokenizer:
 ```
