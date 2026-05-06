@@ -37,5 +37,5 @@ python ./pretraining/laura_train.py
 
 2. Model instruction tuning:
 ```
-python./instruction_tuning/instruction_tuning_learner_english.py
+python ./instruction_tuning/instruction_tuning_learner_english.py
 ```
