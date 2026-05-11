@@ -50,7 +50,7 @@ print("Loaded model on:", device)
 # -----------------------------
 from datasets import load_dataset, concatenate_datasets
 
-learner_english = load_dataset("lilygoulder/learner_tuning_SPA", split="train")
+learner_english = load_dataset("", split="train")
 
 print(learner_english.column_names)
 
@@ -219,5 +219,5 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 
 print("Training complete.")
 
-model.push_to_hub("lilygoulder/es-en-advanced-learner-english")
-tokenizer.push_to_hub("lilygoulder/es-en-advanced-learner-english")
+model.push_to_hub()
+tokenizer.push_to_hub()
