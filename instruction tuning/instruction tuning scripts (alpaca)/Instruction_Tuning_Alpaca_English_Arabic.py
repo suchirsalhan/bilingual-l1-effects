@@ -15,7 +15,6 @@ from transformers import (
 MODEL_NAME = "RA-ALTA/ar-en-beginner"
 MAX_LENGTH = 512
 IGNORE_INDEX = -100
-HF_REPO = "RA-ALTA/ar-en-beginner-alpaca-english-L1"
 LOCAL_DIR = "./dummy_output"  # local save directory
 
 # -----------------------------
@@ -234,7 +233,7 @@ training_args = TrainingArguments(
     bf16=True,
     logging_strategy="steps",
     logging_steps=200,
-    save_strategy="epoch",      # save at end of epoch
+    save_strategy="epoch",      
     dataloader_num_workers=8,
     report_to="none",
     disable_tqdm=False
