@@ -10,14 +10,6 @@ from transformers import (
 )
 
 # -----------------------------
-# ENVIRONMENT (HF token + cache)
-# -----------------------------
-os.environ["HF_HOME"] = "/local/scratch/lgb35/hf_cache"
-HF_TOKEN = os.environ.get("HF_TOKEN")  # make sure you exported this in SSH
-if HF_TOKEN is None:
-    raise ValueError("HF_TOKEN environment variable not set! Run: export HF_TOKEN='your_token_here'")
-
-# -----------------------------
 # CONFIG
 # -----------------------------
 MODEL_NAME = "RA-ALTA/pl-en-advanced"
