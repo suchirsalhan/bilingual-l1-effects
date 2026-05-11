@@ -10,14 +10,6 @@ from transformers import (
 )
 
 # -----------------------------
-# ENVIRONMENT (HF token + cache)
-# -----------------------------
-os.environ["HF_HOME"] = "/local/scratch/lgb35/hf_cache"
-HF_TOKEN = os.environ.get("HF_TOKEN")  # make sure you exported this in SSH
-if HF_TOKEN is None:
-    raise ValueError("HF_TOKEN environment variable not set! Run: export HF_TOKEN='your_token_here'")
-
-# -----------------------------
 # CONFIG
 # -----------------------------
 MODEL_NAME = "RA-ALTA/fr-en-advanced"
@@ -292,12 +284,3 @@ model.save_pretrained(LOCAL_DIR)
 tokenizer.save_pretrained(LOCAL_DIR)
 print(f"Model saved to {LOCAL_DIR}")
 
-# -----------------------------
-# PUSH TO HUGGING FACE HUB (safe)
-# -----------------------------
-print("Pushing model and tokenizer to Hugging Face Hub...")
-# Do NOT pass use_auth_token inside tokenizer files; HF_TOKEN is read from environment
-os.environ["HF_TOKEN"] = HF_TOKEN  # ensure env variable is set
-model.push_to_hub(HF_REPO)         # reads HF_TOKEN automatically
-tokenizer.push_to_hub(HF_REPO)
-print("Training, local save, and push complete!")
